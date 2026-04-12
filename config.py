@@ -46,9 +46,14 @@ MAX_DTE: int = 14
 WATCH_INTERVAL_SECONDS: int = 20        # watcher poll cadence
 SIGNAL_EXPIRY_MINUTES: int = 90         # watchlist TTL
 
-# ── Market data ───────────────────────────────────────────────────────────────
+# ── Alpaca market data ────────────────────────────────────────────────────────
+ALPACA_API_KEY:    str = os.environ.get("ALPACA_API_KEY", "")
+ALPACA_API_SECRET: str = os.environ.get("ALPACA_API_SECRET", "")
+ALPACA_FEED:       str = os.environ.get("ALPACA_FEED", "sip")
+
+# ── Market data caching ───────────────────────────────────────────────────────
 MARKET_DATA_CACHE_TTL: int = 120        # seconds before a re-fetch is attempted
-MARKET_DATA_STALE_TTL: int = 300        # seconds to serve last-known-good data on rate-limit failure
+MARKET_DATA_STALE_TTL: int = 300        # seconds to serve last-known-good data on error
 MARKET_OPEN_ET: tuple[int, int] = (9, 30)
 PREMARKET_START_ET: tuple[int, int] = (4, 0)
 
