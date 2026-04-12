@@ -1,0 +1,17 @@
+# Environment — never commit credentials
+.env
+.env.save
+
+# Runtime data — SQLite dedup DB and Telethon session files
+data/
+session/
+
+# Logs
+logs/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
