@@ -19,7 +19,10 @@ import asyncio
 import logging
 import signal
 import sys
+import uuid
 from pathlib import Path
+
+_INSTANCE_ID = uuid.uuid4().hex[:8]
 
 from telegram import Update
 from telegram.constants import ParseMode
@@ -176,8 +179,14 @@ async def main() -> None:
         init_db()
 
         await application.start()
-        await application.updater.start_polling(allowed_updates=["channel_post"])
-        logger.info("Bot started | source=%s | dest=%s", config.SOURCE_CHANNEL, config.DEST_CHANNEL)
+        await application.updater.start_polling(
+            allowed_updates=["channel_post"],
+            drop_pending_updates=True,
+        )
+        logger.info(
+            "Bot started | instance=%s | source=%s | dest=%s",
+            _INSTANCE_ID, config.SOURCE_CHANNEL, config.DEST_CHANNEL,
+        )
 
         logger.info("Warming market data cache (SPY, QQQ)...")
         try:

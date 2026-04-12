@@ -26,11 +26,19 @@ import config
 logger = logging.getLogger(__name__)
 
 ET = pytz.timezone("America/New_York")
-_MARKET_OPEN    = dtime(9, 30)
+_MARKET_OPEN     = dtime(9, 30)
 _PREMARKET_START = dtime(4, 0)
 _PREMARKET_END   = dtime(9, 30)
 _ALPACA_DATA_URL = "https://data.alpaca.markets"
 _CANDLE_BUFFER_SIZE = 10   # keep last 10 closed candles — enough for 2-candle checks
+
+
+def _is_trading_session() -> bool:
+    """True during hours when equity bars are expected: Mon–Fri 04:00–20:00 ET."""
+    now = datetime.now(ET)
+    if now.weekday() >= 5:          # Saturday=5, Sunday=6
+        return False
+    return dtime(4, 0) <= now.time() <= dtime(20, 0)
 
 
 # ── Internal bar type ─────────────────────────────────────────────────────────
@@ -98,7 +106,10 @@ async def _fetch_bars_alpaca(ticker: str) -> Optional[list[_Bar]]:
             raw = resp.json().get("bars") or []
 
         if not raw:
-            logger.warning("Alpaca: no bars returned for %s", ticker)
+            if _is_trading_session():
+                logger.warning("Alpaca: no bars returned for %s", ticker)
+            else:
+                logger.debug("Alpaca: no bars for %s (market closed)", ticker)
             return None
 
         return _parse_bars(raw)
@@ -293,7 +304,10 @@ class MarketDataService:
                 return last_good[1]
 
             # Layer 3 — no usable data at all
-            logger.error("Alpaca fetch failed for %s — no usable stale data", ticker)
+            if _is_trading_session():
+                logger.error("Alpaca fetch failed for %s — no usable stale data", ticker)
+            else:
+                logger.debug("Alpaca: no data for %s (market closed)", ticker)
             snap = Snapshot(ticker, None, None, None, None, fetch_ok=False)
             # Cache the failure for TTL/4 to avoid hammering the API on every tick
             self._cache[ticker] = (now - self._ttl * 0.75, snap)
