@@ -34,6 +34,7 @@ from app.risk import compute_targets
 from app.watcher import Watcher
 from app.telegram_handler import format_hold, format_go
 from app.storage import init_db, was_sent, mark_sent
+from app.backup import restore_db, backup_db, backup_loop
 
 
 # ── Logging ───────────────────────────────────────────────────────────────────
@@ -73,7 +74,6 @@ def _is_source_channel(chat) -> bool:
 async def main() -> None:
     _setup_logging()
     validate_env()
-    init_db()
 
     market = MarketDataService(
         cache_ttl_seconds=config.MARKET_DATA_CACHE_TTL,
@@ -170,6 +170,12 @@ async def main() -> None:
         loop.add_signal_handler(sig_num, stop_event.set)
 
     async with application:
+        # Restore DB from Telegram backup before init_db creates a blank one
+        if config.BACKUP_CHAT_ID:
+            await restore_db(application.bot, config.BACKUP_CHAT_ID, config.DB_PATH)
+
+        init_db()
+
         await application.start()
         await application.updater.start_polling(allowed_updates=["channel_post"])
         logger.info("Bot started | source=%s | dest=%s", config.SOURCE_CHANNEL, config.DEST_CHANNEL)
@@ -182,16 +188,28 @@ async def main() -> None:
             logger.warning("Warm cache failed (non-fatal): %s", exc)
 
         watcher_task = asyncio.create_task(watcher.run())
+        backup_task = asyncio.create_task(
+            backup_loop(application.bot, config.BACKUP_CHAT_ID, config.DB_PATH)
+        )
 
         await stop_event.wait()
 
         logger.info("Shutdown signal received")
         watcher.stop()
         watcher_task.cancel()
+        backup_task.cancel()
         try:
             await watcher_task
         except asyncio.CancelledError:
             pass
+        try:
+            await backup_task
+        except asyncio.CancelledError:
+            pass
+
+        # Final backup on clean shutdown
+        if config.BACKUP_CHAT_ID:
+            await backup_db(application.bot, config.BACKUP_CHAT_ID, config.DB_PATH)
 
         await application.updater.stop()
         await application.stop()

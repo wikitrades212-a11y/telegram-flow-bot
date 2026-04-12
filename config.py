@@ -55,3 +55,9 @@ PREMARKET_START_ET: tuple[int, int] = (4, 0)
 # ── Paths ─────────────────────────────────────────────────────────────────────
 # Override with DB_PATH=/app/data/signals.db on Railway (mounted volume).
 DB_PATH: str = os.environ.get("DB_PATH", "data/signals.db")
+
+# ── Backup ────────────────────────────────────────────────────────────────────
+# Private channel/group where the bot uploads signals.db for persistence across
+# Railway redeploys. Set to a numeric chat ID (e.g. -1001234567890) or leave
+# blank to disable. The bot must be admin with "Pin Messages" permission.
+BACKUP_CHAT_ID: str = os.environ.get("BACKUP_CHAT_ID", "")
