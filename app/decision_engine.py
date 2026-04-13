@@ -45,6 +45,14 @@ def _hard_filter(sig: FlowSignal) -> Optional[str]:
         return f"vol/oi {sig.vol_oi_ratio:.1f} < {config.MIN_VOL_OI}"
     if sig.dte > config.MAX_DTE:
         return f"dte {sig.dte} > {config.MAX_DTE}"
+    if sig.premium_usd < 50_000:
+        return f"premium ${sig.premium_usd:,.0f} below minimum"
+    if sig.delta is not None and abs(sig.delta) < 0.10:
+        return f"delta {sig.delta:.2f} too far OTM"
+    if sig.side == "CALL" and sig.delta is not None and sig.delta < 0:
+        return f"delta {sig.delta:.2f} contradicts CALL side"
+    if sig.side == "PUT" and sig.delta is not None and sig.delta > 0:
+        return f"delta {sig.delta:.2f} contradicts PUT side"
     return None
 
 

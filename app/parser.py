@@ -41,13 +41,18 @@ class FlowSignal:
     volume: int
     open_interest: int
     vol_oi_ratio: float
-    delta: float
     iv_pct: float
     dte: int
     score: int
     conviction: str     # "A" | "B" | ...
     direction: str      # "BULLISH" | "BEARISH"
+    delta: Optional[float] = None           # None if absent from message
     message_id: Optional[int] = None
+    option_last: Optional[float] = None     # contract last price
+    option_bid: Optional[float] = None
+    option_ask: Optional[float] = None
+    option_mid: Optional[float] = None     # (bid + ask) / 2 — preferred over last
+    option_quote_time: Optional[str] = None
     signal_id: str = field(init=False)
 
     def __post_init__(self):
@@ -138,7 +143,7 @@ def parse_flow_message(text: str, message_id: int = None) -> Optional[FlowSignal
     iv_m = _IV_RE.search(line2)
     dte_m = _DTE_RE.search(line2)
 
-    delta = float(delta_m.group(1)) if delta_m else 0.0
+    delta = float(delta_m.group(1)) if delta_m else None
     iv = float(iv_m.group(1)) if iv_m else 0.0
     dte = int(dte_m.group(1)) if dte_m else 0
 
