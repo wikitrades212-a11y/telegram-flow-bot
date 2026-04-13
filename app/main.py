@@ -237,6 +237,12 @@ async def main() -> None:
 
         init_db()
 
+        # Wait for any previous instance to stop polling before we start.
+        # Railway starts the new container before killing the old one, causing
+        # a brief overlap that triggers a 409 Conflict from Telegram.
+        logger.info("Startup delay (8s) — waiting for previous instance to release polling...")
+        await asyncio.sleep(8)
+
         await application.start()
         await application.updater.start_polling(
             allowed_updates=["channel_post"],
