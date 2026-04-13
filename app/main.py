@@ -195,6 +195,16 @@ async def main() -> None:
         except Exception as exc:
             logger.warning("Warm cache failed (non-fatal): %s", exc)
 
+        # ── Temporary backup startup test ─────────────────────────────────────
+        if config.BACKUP_CHAT_ID:
+            logger.info("[backup] startup test begin")
+            try:
+                chat = await application.bot.get_chat(config.BACKUP_CHAT_ID)
+                logger.info("[backup] get_chat OK | id=%s | title=%s", chat.id, chat.title)
+                await backup_db(application.bot, config.BACKUP_CHAT_ID, config.DB_PATH)
+            except Exception as exc:
+                logger.error("[backup] startup test FAILED: %s", exc)
+
         watcher_task = asyncio.create_task(watcher.run())
         backup_task = asyncio.create_task(
             backup_loop(application.bot, config.BACKUP_CHAT_ID, config.DB_PATH)
