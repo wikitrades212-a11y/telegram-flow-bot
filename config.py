@@ -66,3 +66,8 @@ DB_PATH: str = os.environ.get("DB_PATH", "data/signals.db")
 # Railway redeploys. Set to a numeric chat ID (e.g. -1001234567890) or leave
 # blank to disable. The bot must be admin with "Pin Messages" permission.
 BACKUP_CHAT_ID: str = os.environ.get("BACKUP_CHAT_ID", "")
+
+# ── Tradier ───────────────────────────────────────────────────────────────────
+# Bearer token from https://dash.tradier.com → API Access
+# Used only for option quote context at signal arrival — leave blank to disable.
+TRADIER_TOKEN: str = os.environ.get("TRADIER_TOKEN", "")

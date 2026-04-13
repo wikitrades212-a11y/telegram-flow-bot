@@ -38,6 +38,7 @@ from app.watcher import Watcher
 from app.telegram_handler import format_hold, format_go
 from app.storage import init_db, was_sent, mark_sent
 from app.backup import restore_db, backup_db, backup_loop
+from app.tradier import fetch_option_quote
 
 
 # ── Logging ───────────────────────────────────────────────────────────────────
@@ -130,6 +131,8 @@ async def main() -> None:
         sig = parse_flow_message(message.text, message_id=message.message_id)
         if sig is None:
             return
+
+        await fetch_option_quote(sig)   # populates option_* fields; silent on failure
 
         logger.info(
             "Signal received: %s | score=%d | dte=%d | vol/oi=%.1f",
