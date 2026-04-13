@@ -47,9 +47,17 @@ def init_db() -> None:
                 price_5m         REAL,
                 price_15m        REAL,
                 price_1h         REAL,
-                price_eod        REAL
+                price_eod        REAL,
+                result_30m       TEXT,
+                move_30m         REAL
             )
         """)
+        # Migrate existing DB — ignored if columns already exist
+        for _col in ("result_30m TEXT", "move_30m REAL"):
+            try:
+                conn.execute(f"ALTER TABLE signals ADD COLUMN {_col}")
+            except sqlite3.OperationalError:
+                pass
     logger.info("Storage initialised at %s", _DB)
 
 
@@ -110,6 +118,25 @@ def update_price_check(signal_id: str, column: str, price: float) -> None:
         conn.execute(
             f"UPDATE signals SET {column}=? WHERE signal_id=?",
             (price, signal_id),
+        )
+
+
+def get_signal_entry(signal_id: str):
+    """Return (price_at_go, price_at_signal) for outcome computation, or None."""
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT price_at_go, price_at_signal FROM signals WHERE signal_id=?",
+            (signal_id,),
+        ).fetchone()
+    return row
+
+
+def update_outcome(signal_id: str, result: str, move: float) -> None:
+    """Store 30-minute outcome result and move."""
+    with _connect() as conn:
+        conn.execute(
+            "UPDATE signals SET result_30m=?, move_30m=? WHERE signal_id=?",
+            (result, move, signal_id),
         )
 
 

@@ -42,6 +42,7 @@ from app.telegram_handler import format_hold, format_go
 from app.storage import (
     init_db, was_sent, mark_sent,
     record_signal, update_signal_go, update_price_check,
+    get_signal_entry, update_outcome,
 )
 from app.backup import restore_db, backup_db, backup_loop
 from app.tradier import fetch_option_quote
@@ -83,13 +84,14 @@ def _is_source_channel(chat) -> bool:
 _ET = _pytz.timezone("America/New_York")
 
 
-async def _price_check_task(signal_id: str, ticker: str, market: MarketDataService) -> None:
-    """Background task: store underlying price at +5m, +15m, +1h, and EOD."""
+async def _price_check_task(signal_id: str, ticker: str, side: str, market: MarketDataService) -> None:
+    """Background task: store underlying price at +5m, +15m, +30m, +1h, and EOD."""
     now_et = datetime.now(_ET)
     eod_et = now_et.replace(hour=16, minute=0, second=0, microsecond=0)
     eod_secs = int((eod_et - now_et).total_seconds())
 
-    checks = [(300, "price_5m"), (900, "price_15m"), (3600, "price_1h")]
+    # col=None at 30m means: compute outcome but no price_* column write
+    checks = [(300, "price_5m"), (900, "price_15m"), (1800, None), (3600, "price_1h")]
     if 60 < eod_secs < 28800:           # EOD is today and at least 1 min away
         checks.append((eod_secs, "price_eod"))
 
@@ -100,10 +102,20 @@ async def _price_check_task(signal_id: str, ticker: str, market: MarketDataServi
         try:
             snap = await market.snapshot(ticker)
             if snap.price is not None:
-                update_price_check(signal_id, col, snap.price)
-                logger.debug("Price check | %s | %s=%.4f", signal_id, col, snap.price)
+                if col is not None:
+                    update_price_check(signal_id, col, snap.price)
+                    logger.debug("Price check | %s | %s=%.4f", signal_id, col, snap.price)
+                if delay == 1800:
+                    row = get_signal_entry(signal_id)
+                    if row:
+                        ep = row[0] if row[0] is not None else row[1]
+                        if ep and ep > 0:
+                            mv = (snap.price - ep) / ep if side == "CALL" else (ep - snap.price) / ep
+                            res = "WIN" if mv >= 0.005 else "LOSS" if mv <= -0.005 else "FLAT"
+                            update_outcome(signal_id, res, round(mv, 6))
+                            logger.info("Outcome | %s | %s | move=%.2f%%", signal_id, res, mv * 100)
         except Exception as exc:
-            logger.debug("Price check failed | %s | %s: %s", signal_id, col, exc)
+            logger.debug("Price check failed | %s | %s: %s", signal_id, col or "30m", exc)
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -193,7 +205,7 @@ async def main() -> None:
                 decision = compute_targets(sig, decision)
                 record_signal(sig, decision.price, state="GO")
                 update_signal_go(sig.signal_id, decision.price, datetime.utcnow().isoformat())
-                asyncio.create_task(_price_check_task(sig.signal_id, sig.ticker, market))
+                asyncio.create_task(_price_check_task(sig.signal_id, sig.ticker, sig.side, market))
                 await post_to_b(format_go(sig, decision), signal_id=sig.signal_id, verdict="GO")
                 mark_sent(sig.signal_id, "GO")
             return
@@ -202,7 +214,7 @@ async def main() -> None:
             logger.info("Decision: HOLD | signal=%s | reason=%s", sig.signal_id, decision.reason)
             if not was_sent(sig.signal_id, "HOLD"):
                 record_signal(sig, decision.price, state="HOLD")
-                asyncio.create_task(_price_check_task(sig.signal_id, sig.ticker, market))
+                asyncio.create_task(_price_check_task(sig.signal_id, sig.ticker, sig.side, market))
                 await post_to_b(format_hold(sig, decision), signal_id=sig.signal_id, verdict="HOLD")
                 mark_sent(sig.signal_id, "HOLD")
             watcher.add(sig)
