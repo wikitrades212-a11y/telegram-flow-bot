@@ -29,7 +29,7 @@ _INSTANCE_ID = uuid.uuid4().hex[:8]
 
 from telegram import Update
 from telegram.constants import ParseMode
-from telegram.ext import Application, MessageHandler, ContextTypes, filters
+from telegram.ext import Application, MessageHandler, CommandHandler, ContextTypes, filters
 
 import config
 from config import validate_env
@@ -38,14 +38,14 @@ from app.market_data import MarketDataService, _is_trading_session
 from app.decision_engine import Decision, DecisionEngine
 from app.risk import compute_targets
 from app.watcher import Watcher
-from app.telegram_handler import format_hold, format_go, format_batch_report
+from app.telegram_handler import format_hold, format_go, format_batch_report, format_stats
 from app.classifier import classify_flow
 from app.intel_formatter import format_intel
 from app.batch import BatchStore
 from app.storage import (
     init_db, was_sent, mark_sent,
     record_signal, update_signal_go, update_price_check,
-    get_signal_entry, update_outcome,
+    get_signal_entry, update_outcome, get_stats_summary,
 )
 from app.backup import restore_db, backup_db, backup_loop
 from app.tradier import fetch_option_quote
@@ -181,6 +181,42 @@ async def main() -> None:
 
     watcher = Watcher(engine=engine, on_go=on_go)
 
+    # ── /stats command ───────────────────────────────────────────────────────
+
+    async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """
+        /stats              → last 7 days
+        /stats 30d          → last 30 days
+        /stats ticker NVDA  → filter by ticker
+        /stats class HEDGE_DIRECTIONAL → filter by classification
+        Args can be combined: /stats 30d ticker SPY
+        """
+        args   = context.args or []
+        days   = 7
+        ticker = None
+        cls_f  = None
+
+        i = 0
+        while i < len(args):
+            a = args[i].lower()
+            if a.endswith("d") and a[:-1].isdigit():
+                days = int(a[:-1])
+            elif a == "ticker" and i + 1 < len(args):
+                ticker = args[i + 1].upper()
+                i += 1
+            elif a == "class" and i + 1 < len(args):
+                cls_f = args[i + 1].upper()
+                i += 1
+            i += 1
+
+        summary = get_stats_summary(days=days, ticker=ticker, classification=cls_f)
+        await update.message.reply_text(
+            format_stats(summary),
+            parse_mode=ParseMode.HTML,
+        )
+
+    application.add_handler(CommandHandler("stats", stats_command))
+
     # ── Channel A handler ─────────────────────────────────────────────────────
 
     async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -229,7 +265,7 @@ async def main() -> None:
         elif decision.verdict == "GO":
             if not was_sent(sig.signal_id, "GO"):
                 decision = compute_targets(sig, decision)
-                record_signal(sig, decision.price, state="GO")
+                record_signal(sig, decision.price, state="GO", classification=cls)
                 update_signal_go(sig.signal_id, decision.price, datetime.utcnow().isoformat())
                 asyncio.create_task(_price_check_task(sig.signal_id, sig.ticker, sig.side, market))
                 await post_to_b(format_go(sig, decision), signal_id=sig.signal_id, verdict="GO")
@@ -238,7 +274,7 @@ async def main() -> None:
         elif decision.verdict == "HOLD":
             logger.info("Decision: HOLD | signal=%s | reason=%s", sig.signal_id, decision.reason)
             if not was_sent(sig.signal_id, "HOLD"):
-                record_signal(sig, decision.price, state="HOLD")
+                record_signal(sig, decision.price, state="HOLD", classification=cls)
                 asyncio.create_task(_price_check_task(sig.signal_id, sig.ticker, sig.side, market))
                 mark_sent(sig.signal_id, "HOLD")
             watcher.add(sig)
@@ -281,7 +317,7 @@ async def main() -> None:
 
         await application.start()
         await application.updater.start_polling(
-            allowed_updates=["channel_post"],
+            allowed_updates=["channel_post", "message"],
             drop_pending_updates=True,
         )
         logger.info(

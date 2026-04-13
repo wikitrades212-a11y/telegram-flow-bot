@@ -20,6 +20,45 @@ def _fmt(value, suffix: str = "", fmt: str = ".2f") -> str:
     return f"{value:{fmt}}{suffix}"
 
 
+def format_stats(s: dict) -> str:
+    """Format /stats query result for Telegram."""
+    days    = s["days"]
+    t_note  = f" · {s['ticker_filter']}"       if s.get("ticker_filter")  else ""
+    c_note  = f" · {s['class_filter']}"        if s.get("class_filter")   else ""
+    avg_m   = s["avg_move"]
+    avg_str = f"{avg_m * 100:+.2f}%" if avg_m is not None else "N/A"
+
+    lines = [
+        f"🧠 <b>STATS ({days}D){t_note}{c_note}</b>",
+        "",
+        f"TOTAL SIGNALS: {s['total']}",
+        f"GO / HOLD / KILL: {s['go']} / {s['hold']} / {s['kill']}",
+    ]
+
+    if s["n_results"] == 0:
+        lines += ["", "<i>No completed outcomes yet.</i>"]
+    else:
+        lines += [
+            "",
+            "RESULTS:",
+            f"WIN / LOSS / FLAT: {s['wins']} / {s['losses']} / {s['flats']}",
+            f"WIN RATE: {s['win_rate']}%",
+            f"AVG MOVE (30m): {avg_str}",
+        ]
+
+    if s.get("by_classification"):
+        lines += ["", "BY CLASSIFICATION:"]
+        for c in s["by_classification"]:
+            lines.append(f"• {c['cls']} → {c['win_rate']}% (n={c['n']})")
+
+    if s.get("top_tickers"):
+        lines += ["", "TOP TICKERS:"]
+        for t in s["top_tickers"]:
+            lines.append(f"• {t['ticker']} → {t['win_rate']}% (n={t['n']})")
+
+    return "\n".join(lines)
+
+
 def format_hold(sig: FlowSignal, dec: Decision) -> str:
     label = f"{sig.ticker} {sig.side} FLOW"
 
