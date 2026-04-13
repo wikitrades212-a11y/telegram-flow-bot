@@ -222,6 +222,93 @@ async def main() -> None:
 
     application.add_handler(CommandHandler("stats", stats_command))
 
+    # ── /testsignal command ───────────────────────────────────────────────────
+
+    async def testsignal_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """
+        Inject 3 synthetic signals through the full pipeline.
+        Fetches real Alpaca prices for SPY/QQQ, builds realistic FlowSignals,
+        posts to Channel A, fires batch to Channel B.
+        """
+        from datetime import date, timedelta as _td
+        from app.parser import FlowSignal
+
+        await update.message.reply_text("⏳ Fetching real market data and running test signals...")
+
+        try:
+            ctx = await market.context("SPY")
+            spy = ctx.get("SPY")
+            qqq = ctx.get("QQQ")
+
+            spy_price = (spy.price or 686.0) if spy else 686.0
+            qqq_price = (qqq.price or 618.0) if qqq else 618.0
+            exp3  = date.today() + _td(days=3)
+            exp7  = date.today() + _td(days=7)
+            exp14 = date.today() + _td(days=14)
+
+            test_signals = [
+                FlowSignal(
+                    raw_message="[test]",
+                    ticker="SPY", side="PUT",
+                    strike=round(spy_price * 0.995),
+                    expiration=exp3,
+                    premium_usd=1_450_000,
+                    volume=8200, open_interest=1100,
+                    vol_oi_ratio=7.5, delta=-0.46,
+                    iv_pct=28.4, dte=3,
+                    score=96, conviction="A",
+                    direction="BEARISH",
+                ),
+                FlowSignal(
+                    raw_message="[test]",
+                    ticker="QQQ", side="PUT",
+                    strike=round(qqq_price * 0.99),
+                    expiration=exp7,
+                    premium_usd=920_000,
+                    volume=5400, open_interest=780,
+                    vol_oi_ratio=6.9, delta=-0.42,
+                    iv_pct=31.0, dte=7,
+                    score=91, conviction="A",
+                    direction="BEARISH",
+                ),
+                FlowSignal(
+                    raw_message="[test]",
+                    ticker="NVDA", side="CALL",
+                    strike=round(spy_price * 1.35),
+                    expiration=exp14,
+                    premium_usd=380_000,
+                    volume=3100, open_interest=420,
+                    vol_oi_ratio=7.4, delta=0.31,
+                    iv_pct=52.0, dte=14,
+                    score=88, conviction="A",
+                    direction="BULLISH",
+                ),
+            ]
+
+            test_batch = BatchStore(trigger_count=len(test_signals))
+
+            for sig in test_signals:
+                cls, role, pri = classify_flow(sig)
+                await post_to_a(format_intel(sig, cls, role, pri), signal_id=sig.signal_id)
+                test_batch.add(sig, cls, role, pri, "HOLD")
+                logger.info("Test signal posted | %s | cls=%s | p%d", sig.signal_id, cls, pri)
+
+            analysis = test_batch.analyze_and_reset()
+            await post_to_b(format_batch_report(analysis), verdict="TEST_BATCH")
+
+            await update.message.reply_text(
+                f"✅ Done — {len(test_signals)} signals sent to Channel A, "
+                f"batch report posted to Channel B.\n"
+                f"State: <b>{analysis['state']}</b>  Mode: <b>{analysis['mode']}</b>",
+                parse_mode=ParseMode.HTML,
+            )
+
+        except Exception as exc:
+            logger.error("testsignal failed: %s", exc, exc_info=True)
+            await update.message.reply_text(f"Error: {exc}")
+
+    application.add_handler(CommandHandler("testsignal", testsignal_command))
+
     # ── Channel A handler ─────────────────────────────────────────────────────
 
     async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
