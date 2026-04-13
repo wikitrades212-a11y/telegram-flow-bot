@@ -20,7 +20,10 @@ import logging
 import signal
 import sys
 import uuid
+from datetime import datetime, timedelta
 from pathlib import Path
+
+import pytz as _pytz
 
 _INSTANCE_ID = uuid.uuid4().hex[:8]
 
@@ -36,7 +39,10 @@ from app.decision_engine import Decision, DecisionEngine
 from app.risk import compute_targets
 from app.watcher import Watcher
 from app.telegram_handler import format_hold, format_go
-from app.storage import init_db, was_sent, mark_sent
+from app.storage import (
+    init_db, was_sent, mark_sent,
+    record_signal, update_signal_go, update_price_check,
+)
 from app.backup import restore_db, backup_db, backup_loop
 from app.tradier import fetch_option_quote
 
@@ -70,6 +76,34 @@ def _is_source_channel(chat) -> bool:
         return str(chat.id) == str(src)
     except Exception:
         return False
+
+
+# ── Outcome tracking ─────────────────────────────────────────────────────────
+
+_ET = _pytz.timezone("America/New_York")
+
+
+async def _price_check_task(signal_id: str, ticker: str, market: MarketDataService) -> None:
+    """Background task: store underlying price at +5m, +15m, +1h, and EOD."""
+    now_et = datetime.now(_ET)
+    eod_et = now_et.replace(hour=16, minute=0, second=0, microsecond=0)
+    eod_secs = int((eod_et - now_et).total_seconds())
+
+    checks = [(300, "price_5m"), (900, "price_15m"), (3600, "price_1h")]
+    if 60 < eod_secs < 28800:           # EOD is today and at least 1 min away
+        checks.append((eod_secs, "price_eod"))
+
+    elapsed = 0
+    for delay, col in checks:
+        await asyncio.sleep(delay - elapsed)
+        elapsed = delay
+        try:
+            snap = await market.snapshot(ticker)
+            if snap.price is not None:
+                update_price_check(signal_id, col, snap.price)
+                logger.debug("Price check | %s | %s=%.4f", signal_id, col, snap.price)
+        except Exception as exc:
+            logger.debug("Price check failed | %s | %s: %s", signal_id, col, exc)
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -114,6 +148,7 @@ async def main() -> None:
 
     async def on_go(sig, dec: Decision) -> None:
         dec = compute_targets(sig, dec)
+        update_signal_go(sig.signal_id, dec.price, datetime.utcnow().isoformat())
         await post_to_b(format_go(sig, dec), signal_id=sig.signal_id, verdict="GO")
 
     watcher = Watcher(engine=engine, on_go=on_go)
@@ -156,6 +191,9 @@ async def main() -> None:
         if decision.verdict == "GO":
             if not was_sent(sig.signal_id, "GO"):
                 decision = compute_targets(sig, decision)
+                record_signal(sig, decision.price, state="GO")
+                update_signal_go(sig.signal_id, decision.price, datetime.utcnow().isoformat())
+                asyncio.create_task(_price_check_task(sig.signal_id, sig.ticker, market))
                 await post_to_b(format_go(sig, decision), signal_id=sig.signal_id, verdict="GO")
                 mark_sent(sig.signal_id, "GO")
             return
@@ -163,6 +201,8 @@ async def main() -> None:
         if decision.verdict == "HOLD":
             logger.info("Decision: HOLD | signal=%s | reason=%s", sig.signal_id, decision.reason)
             if not was_sent(sig.signal_id, "HOLD"):
+                record_signal(sig, decision.price, state="HOLD")
+                asyncio.create_task(_price_check_task(sig.signal_id, sig.ticker, market))
                 await post_to_b(format_hold(sig, decision), signal_id=sig.signal_id, verdict="HOLD")
                 mark_sent(sig.signal_id, "HOLD")
             watcher.add(sig)

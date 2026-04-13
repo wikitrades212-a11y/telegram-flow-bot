@@ -28,6 +28,28 @@ def init_db() -> None:
                 PRIMARY KEY (signal_id, verdict)
             )
         """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS signals (
+                signal_id        TEXT PRIMARY KEY,
+                ticker           TEXT NOT NULL,
+                side             TEXT NOT NULL,
+                strike           REAL,
+                expiration       TEXT,
+                premium_usd      REAL,
+                delta            REAL,
+                score            INTEGER,
+                conviction       TEXT,
+                state            TEXT NOT NULL DEFAULT 'HOLD',
+                timestamp_signal TEXT NOT NULL,
+                timestamp_go     TEXT,
+                price_at_signal  REAL,
+                price_at_go      REAL,
+                price_5m         REAL,
+                price_15m        REAL,
+                price_1h         REAL,
+                price_eod        REAL
+            )
+        """)
     logger.info("Storage initialised at %s", _DB)
 
 
@@ -51,6 +73,44 @@ def mark_sent(signal_id: str, verdict: str) -> None:
             (signal_id, verdict, datetime.utcnow().isoformat()),
         )
     logger.debug("Marked sent: %s / %s", signal_id, verdict)
+
+
+def record_signal(sig, price, state: str = "HOLD") -> None:
+    """Insert a new signal row. INSERT OR IGNORE — safe to call on duplicates."""
+    with _connect() as conn:
+        conn.execute("""
+            INSERT OR IGNORE INTO signals
+                (signal_id, ticker, side, strike, expiration,
+                 premium_usd, delta, score, conviction,
+                 state, timestamp_signal, price_at_signal)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            sig.signal_id, sig.ticker, sig.side, sig.strike,
+            sig.expiration.isoformat(), sig.premium_usd, sig.delta,
+            sig.score, sig.conviction, state,
+            datetime.utcnow().isoformat(), price,
+        ))
+
+
+def update_signal_go(signal_id: str, price, ts: str) -> None:
+    """Mark a signal as GO and record the go price and timestamp."""
+    with _connect() as conn:
+        conn.execute(
+            "UPDATE signals SET state='GO', price_at_go=?, timestamp_go=? WHERE signal_id=?",
+            (price, ts, signal_id),
+        )
+
+
+def update_price_check(signal_id: str, column: str, price: float) -> None:
+    """Store a delayed price check. column must be one of the allowed names."""
+    allowed = {"price_5m", "price_15m", "price_1h", "price_eod"}
+    if column not in allowed:
+        return
+    with _connect() as conn:
+        conn.execute(
+            f"UPDATE signals SET {column}=? WHERE signal_id=?",
+            (price, signal_id),
+        )
 
 
 def purge_old(days: int = 30) -> None:
