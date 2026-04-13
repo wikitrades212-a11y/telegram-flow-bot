@@ -67,6 +67,14 @@ DB_PATH: str = os.environ.get("DB_PATH", "data/signals.db")
 # blank to disable. The bot must be admin with "Pin Messages" permission.
 BACKUP_CHAT_ID: str = os.environ.get("BACKUP_CHAT_ID", "")
 
+# ── Intelligence layer ────────────────────────────────────────────────────────
+# Channel A: bot posts structured YAML per flow here (all signals, pre-filter).
+# Leave blank to disable Channel A output.
+INTEL_CHANNEL: str = os.environ.get("INTEL_CHANNEL", "")
+
+# Number of signals that trigger a Channel B batch report.
+BATCH_SIGNAL_COUNT: int = int(os.environ.get("BATCH_SIGNAL_COUNT", "3"))
+
 # ── Tradier ───────────────────────────────────────────────────────────────────
 # Bearer token from https://dash.tradier.com → API Access
 # Used only for option quote context at signal arrival — leave blank to disable.

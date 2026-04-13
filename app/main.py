@@ -38,7 +38,10 @@ from app.market_data import MarketDataService, _is_trading_session
 from app.decision_engine import Decision, DecisionEngine
 from app.risk import compute_targets
 from app.watcher import Watcher
-from app.telegram_handler import format_hold, format_go
+from app.telegram_handler import format_hold, format_go, format_batch_report
+from app.classifier import classify_flow
+from app.intel_formatter import format_intel
+from app.batch import BatchStore
 from app.storage import (
     init_db, was_sent, mark_sent,
     record_signal, update_signal_go, update_price_check,
@@ -129,10 +132,23 @@ async def main() -> None:
         stale_ttl_seconds=config.MARKET_DATA_STALE_TTL,
     )
     engine = DecisionEngine(market)
+    batch  = BatchStore(trigger_count=config.BATCH_SIGNAL_COUNT)
 
     application = Application.builder().token(config.BOT_TOKEN).build()
 
-    # ── Shared send helper ────────────────────────────────────────────────────
+    # ── Shared send helpers ───────────────────────────────────────────────────
+
+    async def post_to_a(text: str, signal_id: str = "") -> None:
+        if not config.INTEL_CHANNEL:
+            return
+        try:
+            await application.bot.send_message(
+                chat_id=config.INTEL_CHANNEL,
+                text=text,
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception as exc:
+            logger.warning("Channel A send FAILED | signal=%s | error: %s", signal_id or "?", exc)
 
     async def post_to_b(text: str, signal_id: str = "", verdict: str = "") -> None:
         logger.info(
@@ -185,22 +201,32 @@ async def main() -> None:
 
         await fetch_option_quote(sig)   # populates option_* fields; silent on failure
 
-        logger.info(
-            "Signal received: %s | score=%d | dte=%d | vol/oi=%.1f",
-            sig.signal_id, sig.score, sig.dte, sig.vol_oi_ratio,
+        # ── Classify and post to Channel A (ALL parsed signals) ──────────────
+        cls, role, pri = classify_flow(sig)
+        asyncio.create_task(
+            post_to_a(format_intel(sig, cls, role, pri), signal_id=sig.signal_id)
         )
 
+        logger.info(
+            "Signal received: %s | cls=%s | role=%s | p%d | score=%d | dte=%d | vol/oi=%.1f",
+            sig.signal_id, cls, role, pri, sig.score, sig.dte, sig.vol_oi_ratio,
+        )
+
+        # ── Evaluate ─────────────────────────────────────────────────────────
         try:
             decision = await engine.evaluate(sig)
         except Exception as exc:
             logger.error("Engine error for %s: %s", sig.signal_id, exc, exc_info=True)
+            batch.add(sig, cls, role, pri, "ERROR")
             return
+
+        # ── Add to batch store ───────────────────────────────────────────────
+        batch.add(sig, cls, role, pri, decision.verdict)
 
         if decision.verdict == "KILL":
             logger.info("Decision: KILL | signal=%s | reason=%s", sig.signal_id, decision.reason)
-            return
 
-        if decision.verdict == "GO":
+        elif decision.verdict == "GO":
             if not was_sent(sig.signal_id, "GO"):
                 decision = compute_targets(sig, decision)
                 record_signal(sig, decision.price, state="GO")
@@ -208,16 +234,26 @@ async def main() -> None:
                 asyncio.create_task(_price_check_task(sig.signal_id, sig.ticker, sig.side, market))
                 await post_to_b(format_go(sig, decision), signal_id=sig.signal_id, verdict="GO")
                 mark_sent(sig.signal_id, "GO")
-            return
 
-        if decision.verdict == "HOLD":
+        elif decision.verdict == "HOLD":
             logger.info("Decision: HOLD | signal=%s | reason=%s", sig.signal_id, decision.reason)
             if not was_sent(sig.signal_id, "HOLD"):
                 record_signal(sig, decision.price, state="HOLD")
                 asyncio.create_task(_price_check_task(sig.signal_id, sig.ticker, sig.side, market))
-                await post_to_b(format_hold(sig, decision), signal_id=sig.signal_id, verdict="HOLD")
                 mark_sent(sig.signal_id, "HOLD")
             watcher.add(sig)
+
+        # ── Batch fire → Channel B market intelligence report ─────────────────
+        if batch.should_post():
+            analysis = batch.analyze_and_reset()
+            await post_to_b(
+                format_batch_report(analysis),
+                verdict="BATCH",
+            )
+            logger.info(
+                "Batch posted | state=%s | mode=%s | signals=%d",
+                analysis.get("state"), analysis.get("mode"), analysis.get("total"),
+            )
 
     application.add_handler(
         MessageHandler(filters.UpdateType.CHANNEL_POSTS, handle_channel_post)
