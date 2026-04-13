@@ -209,11 +209,16 @@ async def main() -> None:
                 i += 1
             i += 1
 
-        summary = get_stats_summary(days=days, ticker=ticker, classification=cls_f)
-        await update.message.reply_text(
-            format_stats(summary),
-            parse_mode=ParseMode.HTML,
-        )
+        logger.info("Stats command received | days=%d | ticker=%s | cls=%s", days, ticker, cls_f)
+        try:
+            summary = get_stats_summary(days=days, ticker=ticker, classification=cls_f)
+            await update.message.reply_text(
+                format_stats(summary),
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception as exc:
+            logger.error("Stats command failed: %s", exc, exc_info=True)
+            await update.message.reply_text("Error running stats. Check logs.")
 
     application.add_handler(CommandHandler("stats", stats_command))
 
