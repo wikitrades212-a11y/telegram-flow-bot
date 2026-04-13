@@ -17,6 +17,7 @@ from typing import Awaitable, Callable
 
 from app.parser import FlowSignal
 from app.decision_engine import Decision, DecisionEngine
+from app.market_data import _is_trading_session
 from app.risk import compute_targets
 from app.storage import was_sent, mark_sent
 import config
@@ -69,6 +70,9 @@ class Watcher:
 
     async def _tick(self) -> None:
         if not self._watch:
+            return
+
+        if not _is_trading_session():
             return
 
         now = datetime.utcnow()

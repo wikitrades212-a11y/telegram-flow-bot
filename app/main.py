@@ -31,7 +31,7 @@ from telegram.ext import Application, MessageHandler, ContextTypes, filters
 import config
 from config import validate_env
 from app.parser import parse_flow_message
-from app.market_data import MarketDataService
+from app.market_data import MarketDataService, _is_trading_session
 from app.decision_engine import Decision, DecisionEngine
 from app.risk import compute_targets
 from app.watcher import Watcher
@@ -126,6 +126,10 @@ async def main() -> None:
             return
 
         if not _is_source_channel(message.chat):
+            return
+
+        if not _is_trading_session():
+            logger.debug("Signal ignored — market closed (weekend/off-hours)")
             return
 
         sig = parse_flow_message(message.text, message_id=message.message_id)
