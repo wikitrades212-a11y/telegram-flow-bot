@@ -25,12 +25,12 @@ _ENTRY_RE = re.compile(
     r"(?:\d+\.\s+|[•·]\s+)"            # "1. " or "• "
     r"(?:[🟢🔴]\s*)?"                    # optional emoji
     r"([A-Z]{1,6})"                      # ticker
-    r"\s+(\d+(?:\.\d+)?)(C|P)"           # strike + type
+    r"\s+\$?(\d+(?:\.\d+)?)(C|P)"        # optional $ + strike + type  e.g. $660C or 660C
     r"(?:\s+\w+)?"                        # optional label e.g. AGGR
     r"\s*\|\s*\$([0-9,.]+[KMBkmb]?)"     # premium
     r"(?:\s+IV:(\d+(?:\.\d+)?)%)?"       # IV (optional)
     r"\s*\|\s*Vol/OI\s+([\d.]+)x"        # vol/OI
-    r"\s*\|\s*Δ\s*([-\d.]+)"             # delta
+    r"\s*\|\s*Δ\s*([+-]?[\d.]+)"         # delta — now accepts +0.57 and -0.28
     r"\s*\|\s*DTE\s+(\d+)"               # DTE
     r"(?:\s*\|\s*(.+))?$",               # tag (optional)
     re.IGNORECASE,
