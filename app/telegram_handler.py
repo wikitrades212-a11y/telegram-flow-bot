@@ -3,16 +3,19 @@ Format outbound messages for Channel A and Channel B.
 
 Channel A (format_intel) — per-flow YAML, see intel_formatter.py.
 Channel B templates:
-  format_hold()              — legacy; kept for compatibility
-  format_go()                — real-time GO alert (still posted immediately)
-  format_channel_b_report()  — NEW structured batch report (required format)
-  format_premarket_report()  — forced 8:30 AM pre-market bias report
-  format_batch_report()      — old report (kept for /testsignal fallback)
-  format_stats()             — /stats command reply
+  format_hold()                  — legacy; kept for compatibility
+  format_go()                    — real-time GO alert (still posted immediately)
+  format_channel_b_report()      — structured batch report from raw signals
+  format_aggregated_report_b()   — Channel B output from aggregated intel report
+  format_premarket_report()      — forced 8:30 AM pre-market bias report
+  format_batch_report()          — old report (kept for /testsignal fallback)
+  format_stats()                 — /stats command reply
 
 All messages use plain text (no HTML parse_mode) unless explicitly noted.
 Channel B send_message uses NO parse_mode — plain UTF-8.
 """
+
+import re
 
 from app.parser import FlowSignal
 from app.decision_engine import Decision
@@ -380,6 +383,104 @@ def format_stats(s: dict) -> str:
         lines += ["", "TOP TICKERS:"]
         for t in s["top_tickers"]:
             lines.append(f"• {t['ticker']} → {t['win_rate']}% (n={t['n']})")
+
+    return "\n".join(lines)
+
+
+# ── Aggregated intel report → Channel B ──────────────────────────────────────
+
+def format_aggregated_report_b(report) -> str:
+    """
+    Re-format a parsed IntelReport into the standard Channel B output.
+
+    Preserves the intelligence from the upstream aggregated report but
+    normalises it into our clean Channel B structure.
+    """
+    from app.intel_parser import IntelReport  # local import to avoid circular
+    if not report:
+        return ""
+
+    bias_emoji = "🟢" if report.direction == "BULLISH" else "🔴"
+    context    = report.context or report.direction
+
+    lines = [
+        f"{bias_emoji} MARKET BIAS: {report.direction} WITH {context}",
+        f"Bear {report.bear_pct}% vs Bull {report.bull_pct}% | Confidence: {report.confidence}/100",
+        "",
+    ]
+
+    def _entry_line(e) -> str:
+        delta_str = f"{e.delta:+.2f}" if e.delta else "N/A"
+        tag = e.tag.strip() if e.tag else ""
+        return (
+            f"{e.ticker} ${e.strike:.0f}{e.side[0]} "
+            f"| {_fmt_p(e.premium_usd)} IV:{e.iv_pct:.0f}% "
+            f"| Vol/OI {e.vol_oi_ratio:.1f}x "
+            f"| Δ {delta_str} "
+            f"| DTE {e.dte}"
+            + (f" | {tag}" if tag else "")
+        )
+
+    # Top Overall Flow
+    if report.top_overall:
+        lines.append("Top Overall Flow")
+        for i, e in enumerate(report.top_overall, 1):
+            lines.append(f"{i}. {_entry_line(e)}")
+        lines.append("")
+
+    # Top Bulls
+    if report.top_bulls:
+        lines.append("Top Bulls")
+        for e in report.top_bulls:
+            lines.append(f"• {_entry_line(e)}")
+        lines.append("")
+
+    # Top Bears
+    if report.top_bears:
+        lines.append("Top Bears")
+        for e in report.top_bears:
+            lines.append(f"• {_entry_line(e)}")
+        lines.append("")
+
+    # Market Structure
+    if report.market_structure:
+        lines.append("Market Structure")
+        for bullet in report.market_structure:
+            # Strip leading emoji/bullet and re-add clean bullet
+            clean = re.sub(r"^[•·📉📈\-\s]+", "", bullet).strip()
+            if clean:
+                lines.append(f"• {clean}")
+        lines.append("")
+
+    # Sector Leadership
+    if report.sector_leadership:
+        lines.append("Sector Leadership")
+        for bullet in report.sector_leadership:
+            clean = re.sub(r"^[•·📉📈\-\s]+", "", bullet).strip()
+            if clean:
+                lines.append(f"• {clean}")
+        lines.append("")
+
+    # Game Plan
+    if report.game_plan:
+        lines.append("Game Plan")
+        for bullet in report.game_plan:
+            clean = bullet.strip()
+            if clean.startswith("▸"):
+                lines.append(clean)
+            elif re.match(r"^(Primary|Secondary|Execution)", clean, re.IGNORECASE):
+                lines.append(f"▸ {clean}")
+            elif clean.startswith("—") or clean.startswith("-"):
+                lines.append(f"  {clean}")
+            else:
+                lines.append(f"  {clean}")
+        lines.append("")
+
+    # Quick Read (headline only — first quoted line or first bullet)
+    if report.quick_read:
+        lines.append("Quick Read")
+        for bullet in report.quick_read[:4]:   # cap at 4 lines
+            lines.append(f"• {bullet.strip().lstrip('•· ')}")
 
     return "\n".join(lines)
 

@@ -43,9 +43,11 @@ from app.telegram_handler import (
     format_go,
     format_channel_b_report,
     format_premarket_report,
+    format_aggregated_report_b,
     format_batch_report,
     format_stats,
 )
+from app.intel_parser import is_aggregated_report, parse_intel_report
 from app.classifier import classify_flow
 from app.intel_formatter import format_intel
 from app.batch import BatchStore
@@ -304,11 +306,32 @@ async def main() -> None:
         if not _is_source_channel(message.chat):
             return
 
-        # ── Parse ─────────────────────────────────────────────────────────────
-        sig = parse_flow_message(message.text, message_id=message.message_id)
-        if sig is None:
-            logger.debug("Message did not parse as FlowSignal — ignored")
+        text = message.text
+
+        # ══ PATH A: Aggregated intel report ═══════════════════════════════════
+        if is_aggregated_report(text):
+            logger.info("Parser path: aggregated_report | msg_id=%s", message.message_id)
+            report = parse_intel_report(text)
+            if report is None:
+                logger.warning(
+                    "aggregated_report detected but failed to parse | msg_id=%s",
+                    message.message_id,
+                )
+                return
+            formatted = format_aggregated_report_b(report)
+            if formatted:
+                await post_to_b(formatted, label="AGGREGATED")
+            else:
+                logger.warning("format_aggregated_report_b returned empty string — NOT sent")
             return
+
+        # ══ PATH B: Raw single-flow signal ════════════════════════════════════
+        sig = parse_flow_message(text, message_id=message.message_id)
+        if sig is None:
+            logger.info("Parser path: ignored | msg_id=%s | no pattern matched", message.message_id)
+            return
+
+        logger.info("Parser path: raw_signal | msg_id=%s | signal=%s", message.message_id, sig.signal_id)
 
         # ── Pre-market branch (07:00–09:29 ET) ───────────────────────────────
         if _is_premarket():
@@ -334,7 +357,7 @@ async def main() -> None:
 
         await fetch_option_quote(sig)
 
-        # ── Classify → Channel A ──────────────────────────────────────────────
+        # ── Classify → Channel A (INTEL_CHANNEL) ─────────────────────────────
         cls, role, pri = classify_flow(sig)
         asyncio.create_task(
             post_to_a(format_intel(sig, cls, role, pri), signal_id=sig.signal_id)
@@ -375,7 +398,7 @@ async def main() -> None:
                 mark_sent(sig.signal_id, "HOLD")
             watcher.add(sig)
 
-        # ── Batch fire → Channel B NEW formatted report ───────────────────────
+        # ── Batch fire → Channel B structured report ──────────────────────────
         if batch.should_post():
             analysis  = batch.analyze_and_reset()
             formatted = format_channel_b_report(analysis)
@@ -414,8 +437,11 @@ async def main() -> None:
             drop_pending_updates=True,
         )
         logger.info(
-            "Bot started | instance=%s | source=%s | dest=%s",
-            _INSTANCE_ID, config.SOURCE_CHANNEL, config.DEST_CHANNEL,
+            "Bot started | instance=%s | SOURCE=%s | DEST=%s | INTEL=%s",
+            _INSTANCE_ID,
+            config.SOURCE_CHANNEL,
+            config.DEST_CHANNEL,
+            config.INTEL_CHANNEL or "(disabled)",
         )
 
         try:
