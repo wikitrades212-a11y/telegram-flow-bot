@@ -381,30 +381,42 @@ async def main() -> None:
 
         # ══ PATH A: Aggregated intel report ═══════════════════════════════════
         if is_aggregated_report(text):
-            logger.info("Parser path: aggregated_report | msg_id=%s", message.message_id)
+            logger.info(
+                "Parser path: aggregated_report | detection=MATCHED | msg_id=%s",
+                message.message_id,
+            )
             report = parse_intel_report(text, msg_id=message.message_id)
+
             if report is None:
-                # Fallback: parser failed entirely — send raw text stripped of
-                # excess whitespace so Channel B still gets something.
                 logger.warning(
-                    "Aggregated parser returned None — sending raw fallback | msg_id=%s",
+                    "Parser path: AGGREGATED_RAW_FALLBACK | reason=parse_returned_None "
+                    "| msg_id=%s — sending whitespace-cleaned raw text",
                     message.message_id,
                 )
-                fallback = "\n".join(
-                    line.strip() for line in text.splitlines() if line.strip()
-                )
-                await post_to_b(fallback, label="AGGREGATED_RAW")
+                fallback = "\n".join(l.strip() for l in text.splitlines() if l.strip())
+                await post_to_b(fallback, label="AGGREGATED_RAW_FALLBACK")
                 return
+
             formatted = format_aggregated_report_b(report)
-            if formatted:
-                await post_to_b(formatted, label="AGGREGATED")
-            else:
-                # Formatter produced nothing — send raw fallback
+
+            if not formatted:
                 logger.warning(
-                    "format_aggregated_report_b returned empty — sending raw fallback | msg_id=%s",
-                    message.message_id,
+                    "Parser path: AGGREGATED_RAW_FALLBACK | reason=formatter_returned_empty "
+                    "| msg_id=%s | parsed direction=%s bulls=%d bears=%d — sending raw",
+                    message.message_id, report.direction,
+                    len(report.top_bulls), len(report.top_bears),
                 )
-                await post_to_b(text.strip(), label="AGGREGATED_RAW")
+                await post_to_b(text.strip(), label="AGGREGATED_RAW_FALLBACK")
+                return
+
+            logger.info(
+                "Parser path: AGGREGATED_PARSED | msg_id=%s | direction=%s "
+                "| confidence=%d | top_overall=%d | bulls=%d | bears=%d | chars=%d",
+                message.message_id, report.direction, report.confidence,
+                len(report.top_overall), len(report.top_bulls), len(report.top_bears),
+                len(formatted),
+            )
+            await post_to_b(formatted, label="AGGREGATED_PARSED")
             return
 
         # ══ PATH B: Raw single-flow signal ════════════════════════════════════
