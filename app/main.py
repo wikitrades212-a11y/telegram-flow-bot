@@ -382,18 +382,29 @@ async def main() -> None:
         # ══ PATH A: Aggregated intel report ═══════════════════════════════════
         if is_aggregated_report(text):
             logger.info("Parser path: aggregated_report | msg_id=%s", message.message_id)
-            report = parse_intel_report(text)
+            report = parse_intel_report(text, msg_id=message.message_id)
             if report is None:
+                # Fallback: parser failed entirely — send raw text stripped of
+                # excess whitespace so Channel B still gets something.
                 logger.warning(
-                    "aggregated_report detected but failed to parse | msg_id=%s",
+                    "Aggregated parser returned None — sending raw fallback | msg_id=%s",
                     message.message_id,
                 )
+                fallback = "\n".join(
+                    line.strip() for line in text.splitlines() if line.strip()
+                )
+                await post_to_b(fallback, label="AGGREGATED_RAW")
                 return
             formatted = format_aggregated_report_b(report)
             if formatted:
                 await post_to_b(formatted, label="AGGREGATED")
             else:
-                logger.warning("format_aggregated_report_b returned empty string — NOT sent")
+                # Formatter produced nothing — send raw fallback
+                logger.warning(
+                    "format_aggregated_report_b returned empty — sending raw fallback | msg_id=%s",
+                    message.message_id,
+                )
+                await post_to_b(text.strip(), label="AGGREGATED_RAW")
             return
 
         # ══ PATH B: Raw single-flow signal ════════════════════════════════════
