@@ -59,6 +59,24 @@ def _slot_key(dt: datetime) -> str:
     return dt.strftime(f"%Y-%m-%d_%H:{minute:02d}")
 
 
+def _warn_holiday_coverage() -> None:
+    """
+    Warn if it is December and the next calendar year has no entries in
+    _NYSE_HOLIDAYS.  Safe to call repeatedly — the log rate is controlled
+    by the caller.
+    """
+    now = _now_et()
+    if now.month != 12:
+        return
+    next_year = now.year + 1
+    if not any(s.startswith(f"{next_year}-") for s in _NYSE_HOLIDAYS):
+        logger.warning(
+            "NYSE holiday list is missing %d dates — add them before Jan 1 "
+            "(update _NYSE_HOLIDAYS in scheduler.py)",
+            next_year,
+        )
+
+
 def _in_schedule(dt: datetime) -> bool:
     if dt.weekday() >= 5:
         return False
@@ -289,6 +307,7 @@ class Scheduler:
         self._ctx      = _Context()
         self._manual_slots: set[str] = set()   # slots where manual send happened
         self._fired_slots:  set[str] = set()   # slots where scheduled report fired
+        self._holiday_warn_date: str = ""       # date of last holiday-coverage warning
 
     # ── Public API ────────────────────────────────────────────────────────────
 
@@ -302,6 +321,7 @@ class Scheduler:
         logger.info(
             "Scheduler started | window=07:00–16:30 ET | interval=30min | weekdays only"
         )
+        _warn_holiday_coverage()   # once at process start
         while True:
             delay = _seconds_until_next_slot()
             next_et = _now_et() + timedelta(seconds=delay)
@@ -321,9 +341,15 @@ class Scheduler:
     # ── Tick ──────────────────────────────────────────────────────────────────
 
     async def _tick(self) -> None:
-        now   = _now_et()
-        slot  = _slot_key(now)
-        rtype = _report_type(now)
+        now      = _now_et()
+        today    = now.strftime("%Y-%m-%d")
+        slot     = _slot_key(now)
+        rtype    = _report_type(now)
+
+        # Re-check holiday coverage at most once per calendar day
+        if today != self._holiday_warn_date:
+            _warn_holiday_coverage()
+            self._holiday_warn_date = today
 
         if not _in_schedule(now):
             logger.debug("Scheduler: outside window (%s) — skip", now.strftime("%H:%M"))
