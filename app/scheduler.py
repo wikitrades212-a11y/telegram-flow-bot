@@ -1,9 +1,10 @@
 """
 Scheduled market intelligence reports.
 
-Fires at every :00 and :30 mark from 07:00 to 16:00 ET on weekdays.
+Fires at every :00 and :30 mark from 07:00 to 16:30 ET on weekdays.
 - 07:00–09:00 ET  → PREMARKET report
 - 09:30–16:00 ET  → MARKET report
+- 16:00–16:30 ET  → EOD report
 
 If fresh signals exist in the last 30 min → structured Channel B report.
 If not → concise MARKET SNAPSHOT with carry-forward context.
@@ -27,8 +28,9 @@ logger = logging.getLogger(__name__)
 
 _ET             = pytz.timezone("America/New_York")
 _SCHEDULE_START = dtime(7, 0)
-_SCHEDULE_END   = dtime(16, 0)
+_SCHEDULE_END   = dtime(16, 30)
 _MARKET_OPEN    = dtime(9, 30)
+_MARKET_CLOSE   = dtime(16, 0)
 
 _SendFn = Callable[[str, str], Awaitable[None]]   # post_to_b(text, label)
 
@@ -53,7 +55,12 @@ def _in_schedule(dt: datetime) -> bool:
 
 
 def _report_type(dt: datetime) -> str:
-    return "PREMARKET" if dt.time() < _MARKET_OPEN else "MARKET"
+    t = dt.time().replace(second=0, microsecond=0)
+    if t < _MARKET_OPEN:
+        return "PREMARKET"
+    if t >= _MARKET_CLOSE:
+        return "EOD"
+    return "MARKET"
 
 
 def _seconds_until_next_slot() -> float:
@@ -173,12 +180,92 @@ async def _fmt_structured(
     return header + body if body else ""
 
 
+# ── EOD report formatter ─────────────────────────────────────────────────────
+
+async def _fmt_eod(
+    entries: list[BatchEntry],
+    ctx: _Context,
+    slot: str,
+    market=None,
+) -> str:
+    """
+    End-of-day summary.  Always produces output — renders gracefully with
+    zero entries, zero actionable contracts, weak/mixed flow, or no Alpaca data.
+    """
+    date_str = slot.split("_")[0]          # "2026-04-14"
+    sep      = "─" * 30
+
+    lines = [f"EOD SUMMARY — {date_str}", sep]
+
+    # ── Session direction from carry-forward context ──────────────────────────
+    direction = ctx.direction
+    if direction == "BULLISH":
+        lines.append("Session bias: BULLISH")
+    elif direction == "BEARISH":
+        lines.append("Session bias: BEARISH")
+    else:
+        lines.append("Session bias: NEUTRAL / Mixed")
+
+    if ctx.leaders:
+        lines.append(f"Leaders:  {', '.join(ctx.leaders)}")
+    if ctx.laggards:
+        lines.append(f"Laggards: {', '.join(ctx.laggards)}")
+
+    # ── Last 30-min flow ──────────────────────────────────────────────────────
+    lines.append("")
+    if entries:
+        bulls = [e for e in entries if e.side == "CALL"]
+        bears = [e for e in entries if e.side == "PUT"]
+        lines.append(f"Last 30-min flow: {len(entries)} signal(s)")
+        if bulls:
+            lines.append(f"  Calls: {', '.join(e.ticker for e in bulls[:3])}")
+        if bears:
+            lines.append(f"  Puts:  {', '.join(e.ticker for e in bears[:3])}")
+    else:
+        lines.append("Last 30-min flow: No new signals")
+
+    # ── Market close RS (best-effort — skipped gracefully on failure) ─────────
+    if market:
+        try:
+            flow_dir = direction if direction in ("BULLISH", "BEARISH") else "NEUTRAL"
+            tickers  = list(dict.fromkeys(e.ticker for e in entries))[:5]
+            rs_data  = await compute_rs(market, flow_dir, 0, tickers)
+            idx      = rs_data.indices if (rs_data and rs_data.data_ok) else None
+            if idx and idx.data_ok:
+                def _pos(above):
+                    if above is True:  return "above VWAP"
+                    if above is False: return "below VWAP"
+                    return "N/A"
+                lines.append("")
+                lines.append(
+                    f"Close: SPY {_pos(idx.spy_above_vwap)}"
+                    f" · QQQ {_pos(idx.qqq_above_vwap)}"
+                    f" · IWM {_pos(idx.iwm_above_vwap)}"
+                )
+                if rs_data.market_state not in (None, "NO_DATA"):
+                    lines.append(f"Market state: {rs_data.market_state}")
+        except Exception as exc:
+            logger.warning("EOD RS fetch failed (skipped): %s", exc)
+
+    # ── Closing stance ────────────────────────────────────────────────────────
+    lines.append("")
+    if direction == "BULLISH" and ctx.leaders:
+        stance = "BULLISH CLOSE — monitor overnight for continuation"
+    elif direction == "BEARISH" and ctx.laggards:
+        stance = "BEARISH CLOSE — watch for gap-down risk"
+    else:
+        stance = "NEUTRAL CLOSE — no clear overnight bias"
+    lines.append(f"Stance: {stance}")
+
+    return "\n".join(lines)
+
+
 # ── Scheduler ─────────────────────────────────────────────────────────────────
 
 class Scheduler:
     """
     Fires a scheduled report to Channel B at every :00/:30 mark
-    within the 07:00–16:00 ET window on weekdays.
+    within the 07:00–16:30 ET window on weekdays.
     """
 
     def __init__(self, window: SignalWindow, send_fn: _SendFn, market=None) -> None:
@@ -199,7 +286,7 @@ class Scheduler:
 
     async def run(self) -> None:
         logger.info(
-            "Scheduler started | window=07:00–16:00 ET | interval=30min | weekdays only"
+            "Scheduler started | window=07:00–16:30 ET | interval=30min | weekdays only"
         )
         while True:
             delay = _seconds_until_next_slot()
@@ -228,11 +315,31 @@ class Scheduler:
             logger.debug("Scheduler: outside window (%s) — skip", now.strftime("%H:%M"))
             return
 
+        # Dedup: one report per slot regardless of type
         if slot in self._fired_slots:
             logger.debug("Scheduler: slot %s already fired — skip", slot)
             return
 
         entries = self._window.fresh()
+
+        logger.info(
+            "Scheduled report fired | slot=%s | type=%s | fresh_signals=%d",
+            slot, rtype, len(entries),
+        )
+
+        # ── EOD: always force-send, skip spam control, skip signal threshold ──
+        if rtype == "EOD":
+            text  = await _fmt_eod(entries, self._ctx, slot, market=self._market)
+            label = "SCHEDULED_EOD"
+            # text is guaranteed non-empty by _fmt_eod, but guard just in case
+            if not text:
+                text = _fmt_snapshot(rtype, self._ctx, slot)
+            await self._send(text, label)
+            self._fired_slots.add(slot)
+            self._prune_slots()
+            return
+
+        # ── Normal slots: spam control + signal threshold ─────────────────────
 
         # Spam control: slot was manually covered AND no new signals
         if slot in self._manual_slots and not entries:
@@ -243,12 +350,6 @@ class Scheduler:
             self._fired_slots.add(slot)
             return
 
-        logger.info(
-            "Scheduled report fired | slot=%s | type=%s | fresh_signals=%d",
-            slot, rtype, len(entries),
-        )
-
-        # Choose format
         MIN_SIGNALS = 1 if rtype == "PREMARKET" else 2
         if len(entries) >= MIN_SIGNALS:
             text = await _fmt_structured(rtype, entries, slot, market=self._market)
@@ -259,7 +360,6 @@ class Scheduler:
                 text = _fmt_snapshot(rtype, self._ctx, slot)
                 label = f"SCHEDULED_{rtype}_SNAPSHOT"
             else:
-                # Update carry-forward context from this analysis
                 self._update_context(entries)
         else:
             text  = _fmt_snapshot(rtype, self._ctx, slot)
@@ -268,12 +368,17 @@ class Scheduler:
         if text:
             await self._send(text, label)
             self._fired_slots.add(slot)
-            # Prune old slots to avoid unbounded growth
-            cutoff = (_now_et() - timedelta(hours=12)).strftime("%Y-%m-%d_%H:%M")
-            self._fired_slots  = {s for s in self._fired_slots  if s >= cutoff}
-            self._manual_slots = {s for s in self._manual_slots if s >= cutoff}
+            self._prune_slots()
         else:
             logger.warning("Scheduler: empty report for slot %s — not sent", slot)
+
+    # ── Slot pruning ──────────────────────────────────────────────────────────
+
+    def _prune_slots(self) -> None:
+        """Discard slot keys older than 12 hours to avoid unbounded growth."""
+        cutoff = (_now_et() - timedelta(hours=12)).strftime("%Y-%m-%d_%H:%M")
+        self._fired_slots  = {s for s in self._fired_slots  if s >= cutoff}
+        self._manual_slots = {s for s in self._manual_slots if s >= cutoff}
 
     # ── Context update ────────────────────────────────────────────────────────
 
