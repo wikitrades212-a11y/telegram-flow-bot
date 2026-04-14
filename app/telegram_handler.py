@@ -215,6 +215,62 @@ class _T:
     CONFIDENCE_DIV_PENALTY:      float = 0.80
 
 
+# ── Regime persistence tracker ───────────────────────────────────────────────
+
+class RegimeTracker:
+    """
+    Prevents noisy regime flips by requiring _REQUIRED_CYCLES consecutive
+    cycles to agree on a new tag before the displayed regime is updated.
+
+    Thread-safe for a single asyncio event loop.
+    """
+    _REQUIRED_CYCLES: int = 2
+
+    def __init__(self) -> None:
+        self._displayed:        str = ""
+        self._candidate:        str = ""
+        self._candidate_count:  int = 0
+
+    def update(self, raw: str) -> tuple[str, bool, str]:
+        """
+        Feed a freshly-derived raw regime.
+        Returns (displayed_regime, changed: bool, old_regime).
+        `changed` is True only when the stable displayed regime flips.
+        """
+        # Bootstrap on first call
+        if not self._displayed:
+            self._displayed       = raw
+            self._candidate       = raw
+            self._candidate_count = 1
+            return self._displayed, False, ""
+
+        # Raw matches current stable display → no change
+        if raw == self._displayed:
+            self._candidate       = raw
+            self._candidate_count = 1
+            return self._displayed, False, ""
+
+        # Raw differs — accumulate candidate cycles
+        if raw == self._candidate:
+            self._candidate_count += 1
+        else:
+            self._candidate       = raw
+            self._candidate_count = 1
+
+        if self._candidate_count >= self._REQUIRED_CYCLES:
+            old                   = self._displayed
+            self._displayed       = raw
+            self._candidate_count = 0
+            return self._displayed, True, old
+
+        # Not enough cycles yet — keep showing the stable regime
+        return self._displayed, False, ""
+
+
+# Module-level singleton — shared across all formatter calls in this process
+_regime_tracker = RegimeTracker()
+
+
 # ── Market Regime Tag ─────────────────────────────────────────────────────────
 
 def _derive_regime_tag(
@@ -332,8 +388,18 @@ def _fmt_regime_block(
     market_state: str,
     indices: Optional["IndexRS"],
 ) -> str:
-    tag = _derive_regime_tag(direction, confidence, market_state, indices)
-    return f"MARKET REGIME:\n{tag}"
+    """
+    Returns the MARKET REGIME block, optionally preceded by a REGIME CHANGE
+    notice when the displayed regime flips from the previous cycle.
+    """
+    raw_tag = _derive_regime_tag(direction, confidence, market_state, indices)
+    displayed, changed, old = _regime_tracker.update(raw_tag)
+    parts: list[str] = []
+    if changed and old:
+        parts.append(f"REGIME CHANGE:\n{old} → {displayed}")
+        parts.append("")
+    parts.append(f"MARKET REGIME:\n{displayed}")
+    return "\n".join(parts)
 
 
 # ── Per-instrument decision helpers ──────────────────────────────────────────
@@ -593,6 +659,138 @@ def _compute_structured_confidence(
             score -= 10
 
     return max(0, min(100, score))
+
+
+# ── Driver list ───────────────────────────────────────────────────────────────
+
+def _fmt_driver_list(
+    entries_bull: list,
+    entries_bear: list,
+    rs_data: Optional["MarketRS"],
+) -> str:
+    """
+    Build DRIVERS block.
+
+    Driving higher: bullish-flow tickers, promoted if their RS is STRONG.
+    Dragging lower: bearish-flow tickers, promoted if their RS is WEAK.
+    RS-only tickers (no matching flow entry) are appended when relevant.
+    """
+    def _tickers(entries: list) -> list[str]:
+        seen: list[str] = []
+        for e in entries:
+            t = getattr(e, "ticker", "")
+            if t and t not in seen:
+                seen.append(t)
+        return seen[:4]
+
+    up_tickers   = _tickers(entries_bull)
+    down_tickers = _tickers(entries_bear)
+
+    # Augment from RS data (STRONG → driving higher, WEAK → dragging lower)
+    if rs_data and rs_data.tickers:
+        for t, rs in rs_data.tickers.items():
+            if rs.classification == "STRONG" and t not in up_tickers:
+                up_tickers.append(t)
+            elif rs.classification == "WEAK" and t not in down_tickers:
+                down_tickers.append(t)
+        up_tickers   = up_tickers[:4]
+        down_tickers = down_tickers[:4]
+
+    if not up_tickers and not down_tickers:
+        return ""
+
+    lines = ["", "DRIVERS:"]
+    lines.append(f"- Driving higher: {', '.join(up_tickers)  if up_tickers   else 'None'}")
+    lines.append(f"- Dragging lower: {', '.join(down_tickers) if down_tickers else 'None'}")
+    return "\n".join(lines)
+
+
+# ── Futures conviction rank ────────────────────────────────────────────────────
+
+def _fmt_conviction_rank(
+    market_state: str,
+    indices: Optional["IndexRS"],
+    direction: str,
+    confidence: int,
+    rs_data: Optional["MarketRS"],
+) -> str:
+    """
+    Rank tradeable futures instruments by quality of alignment between
+    flow, VWAP, breadth, and RS.  Output after EXECUTION PLAN.
+
+    Scoring (each instrument independently):
+      up to 30 pts  — VWAP distance of reference index
+      20 pts        — both SPY + QQQ aligned
+      15 pts        — IWM breadth confirms direction
+      up to 20 pts  — flow confidence contribution
+      up to 15 pts  — RS ticker confirmations
+      −5  pts       — RTY / YM higher-bar penalty
+    Only instruments with a LONG or SHORT decision are eligible.
+    """
+    if not indices or not indices.data_ok:
+        return ""
+
+    decisions = {
+        "NQ":  _nq_decision(indices, market_state, confidence)[0],
+        "ES":  _es_decision(indices, market_state, confidence)[0],
+        "RTY": _rty_decision(indices, market_state)[0],
+        "YM":  _ym_decision(indices, market_state)[0],
+    }
+
+    def _score(inst: str, action: str) -> float:
+        if action == "NO TRADE":
+            return -1.0
+        s = 0.0
+
+        # VWAP distance of the primary reference index
+        ref_pct = {
+            "NQ":  abs(indices.qqq_pct_vs_vwap or 0.0),
+            "ES":  abs(indices.spy_pct_vs_vwap  or 0.0),
+            "RTY": abs(indices.iwm_pct_vs_vwap  or 0.0),
+            "YM":  abs(indices.spy_pct_vs_vwap  or 0.0),
+        }.get(inst, 0.0)
+        s += min(30.0, ref_pct * 20.0)
+
+        # Both major indices aligned
+        if indices.spy_above_vwap is not None and indices.qqq_above_vwap is not None:
+            if indices.spy_above_vwap == indices.qqq_above_vwap:
+                s += 20.0
+
+        # IWM breadth confirmation
+        iwm = indices.iwm_above_vwap
+        if iwm is not None:
+            confirms = (action == "LONG" and iwm) or (action == "SHORT" and not iwm)
+            if confirms:
+                s += 15.0
+
+        # Flow confidence contribution (linear, max 20 pts)
+        s += confidence * 0.20
+
+        # RS ticker confirmation
+        if rs_data and rs_data.tickers:
+            aligned = sum(
+                1 for t in rs_data.tickers.values()
+                if (action == "LONG"  and t.classification == "STRONG") or
+                   (action == "SHORT" and t.classification == "WEAK")
+            )
+            s += min(15.0, aligned * 7.0)
+
+        # Higher-bar penalty for RTY / YM (require additional confirmation)
+        if inst in ("RTY", "YM"):
+            s -= 5.0
+
+        return s
+
+    ranked = sorted(
+        [(inst, act, _score(inst, act)) for inst, act in decisions.items()],
+        key=lambda x: x[2], reverse=True,
+    )
+    eligible = [(inst, act) for inst, act, sc in ranked if sc >= 0]
+
+    primary   = eligible[0][0] if len(eligible) >= 1 else "NONE"
+    secondary = eligible[1][0] if len(eligible) >= 2 else "NONE"
+
+    return f"\nBEST EXPRESSION:\n- Primary: {primary}\n- Secondary: {secondary}"
 
 
 # ── Execution plan ─────────────────────────────────────────────────────────────
@@ -1034,11 +1232,18 @@ def format_channel_b_report(analysis: dict, rs_data: Optional["MarketRS"] = None
     if actionable_section:
         lines.append(actionable_section)
 
-    # ── Market Regime Tag ─────────────────────────────────────────────────────
-    ms = rs_data.market_state if (rs_data and rs_data.data_ok) else "NO_DATA"
-    regime_indices = rs_data.indices if (rs_data and rs_data.data_ok) else None
+    # ── Market Regime Tag (with change detection + persistence) ──────────────
+    ms             = rs_data.market_state if (rs_data and rs_data.data_ok) else "NO_DATA"
+    regime_indices = rs_data.indices      if (rs_data and rs_data.data_ok) else None
     lines.append("")
     lines.append(_fmt_regime_block(effective_direction, confidence, ms, regime_indices))
+
+    # ── Driver List ───────────────────────────────────────────────────────────
+    bulls_list = sorted([e for e in actionable if e.side == "CALL"], key=lambda e: e.priority)
+    bears_list = sorted([e for e in actionable if e.side == "PUT"],  key=lambda e: e.priority)
+    driver_block = _fmt_driver_list(bulls_list, bears_list, rs_data)
+    if driver_block:
+        lines.append(driver_block)
 
     # ── Execution Plan (RS-powered) ───────────────────────────────────────────
     if rs_data and rs_data.data_ok:
@@ -1048,10 +1253,14 @@ def format_channel_b_report(analysis: dict, rs_data: Optional["MarketRS"] = None
         )
         if exec_plan:
             lines.append(exec_plan)
+        conviction = _fmt_conviction_rank(
+            rs_data.market_state, rs_data.indices,
+            effective_direction, confidence, rs_data,
+        )
+        if conviction:
+            lines.append(conviction)
 
     # ── Final Verdict ─────────────────────────────────────────────────────────
-    bulls_list = sorted([e for e in actionable if e.side == "CALL"], key=lambda e: e.priority)
-    bears_list = sorted([e for e in actionable if e.side == "PUT"],  key=lambda e: e.priority)
     lines.append(_fmt_final_verdict(
         ms, effective_direction, confidence, rs_data,
         bull_pct, bear_pct, actionable, bulls_list, bears_list,
@@ -1361,11 +1570,16 @@ def format_aggregated_report_b(report, rs_data: Optional["MarketRS"] = None) -> 
     if actionable_section:
         lines.append(actionable_section)
 
-    # ── Market Regime Tag ─────────────────────────────────────────────────────
+    # ── Market Regime Tag (with change detection + persistence) ──────────────
     ms             = rs_data.market_state if (rs_data and rs_data.data_ok) else "NO_DATA"
-    regime_indices = rs_data.indices if (rs_data and rs_data.data_ok) else None
+    regime_indices = rs_data.indices      if (rs_data and rs_data.data_ok) else None
     lines.append("")
     lines.append(_fmt_regime_block(effective_direction, report.confidence, ms, regime_indices))
+
+    # ── Driver List ───────────────────────────────────────────────────────────
+    driver_block = _fmt_driver_list(report.top_bulls, report.top_bears, rs_data)
+    if driver_block:
+        lines.append(driver_block)
 
     # ── Execution Plan (RS-powered) ───────────────────────────────────────────
     if rs_data and rs_data.data_ok:
@@ -1375,6 +1589,12 @@ def format_aggregated_report_b(report, rs_data: Optional["MarketRS"] = None) -> 
         )
         if exec_plan:
             lines.append(exec_plan)
+        conviction = _fmt_conviction_rank(
+            rs_data.market_state, rs_data.indices,
+            effective_direction, report.confidence, rs_data,
+        )
+        if conviction:
+            lines.append(conviction)
 
     # ── Final Verdict ─────────────────────────────────────────────────────────
     lines.append(_fmt_final_verdict(
