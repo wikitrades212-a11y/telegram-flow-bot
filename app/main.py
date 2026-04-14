@@ -48,6 +48,7 @@ from app.telegram_handler import (
     format_stats,
 )
 from app.intel_parser import is_aggregated_report, parse_intel_report
+from app.scheduler import Scheduler, SignalWindow
 from app.classifier import classify_flow
 from app.intel_formatter import format_intel
 from app.batch import BatchStore
@@ -246,21 +247,25 @@ async def main() -> None:
     engine     = DecisionEngine(market)
     batch      = BatchStore(trigger_count=config.BATCH_SIGNAL_COUNT)
     pm_tracker = PremarketTracker()
+    sig_window = SignalWindow(window_minutes=30)
 
     application = Application.builder().token(config.BOT_TOKEN).build()
 
     # ── Send helpers ──────────────────────────────────────────────────────────
 
-    _src_id  = _normalize_chat_id(config.SOURCE_CHANNEL)
-    _dest_id = _normalize_chat_id(config.DEST_CHANNEL)
+    _src_id   = _normalize_chat_id(config.SOURCE_CHANNEL)
+    _dest_id  = _normalize_chat_id(config.DEST_CHANNEL)
     _intel_id = _normalize_chat_id(config.INTEL_CHANNEL) if config.INTEL_CHANNEL else None
+
+    # Mutable ref so post_to_b can call scheduler.mark_manual_send() after
+    # scheduler is created below.
+    _scheduler_ref: list[Scheduler] = []
 
     async def post_to_b(text: str, label: str = "") -> None:
         """Send a NEW plain-text message to Channel B. Never forwards. Never writes to source."""
         if not text:
             logger.warning("post_to_b called with empty text | label=%s", label)
             return
-        # Guard: refuse to send Channel B output into the source channel
         if _dest_id == _src_id:
             logger.error(
                 "ROUTING GUARD: post_to_b aborted — DEST_CHANNEL equals SOURCE_CHANNEL (%s). "
@@ -281,6 +286,9 @@ async def main() -> None:
                 "Channel B send OK | tg_msg_id=%d | label=%s",
                 sent.message_id, label or "?",
             )
+            # Mark slot as manually covered for spam control (only for non-scheduled sends)
+            if _scheduler_ref and not label.startswith("SCHEDULED_"):
+                _scheduler_ref[0].mark_manual_send()
         except Exception as exc:
             logger.error(
                 "Channel B send FAILED | dest=%s | label=%s | error: %s",
@@ -471,6 +479,7 @@ async def main() -> None:
             return
 
         batch.add(sig, cls, role, pri, decision.verdict)
+        sig_window.add(batch._entries[-1])   # feed latest entry to rolling window
 
         if decision.verdict == "KILL":
             logger.info("Decision: KILL | signal=%s | reason=%s", sig.signal_id, decision.reason)
@@ -544,9 +553,13 @@ async def main() -> None:
         except Exception as exc:
             logger.warning("Warm cache failed (non-fatal): %s", exc)
 
-        watcher_task = asyncio.create_task(watcher.run())
-        pm_task      = asyncio.create_task(_forced_830_loop())
-        backup_task  = asyncio.create_task(
+        scheduler = Scheduler(window=sig_window, send_fn=post_to_b)
+        _scheduler_ref.append(scheduler)
+
+        watcher_task   = asyncio.create_task(watcher.run())
+        pm_task        = asyncio.create_task(_forced_830_loop())
+        scheduler_task = asyncio.create_task(scheduler.run())
+        backup_task    = asyncio.create_task(
             backup_loop(application.bot, config.BACKUP_CHAT_ID, config.DB_PATH)
         )
 
@@ -554,7 +567,7 @@ async def main() -> None:
 
         logger.info("Shutdown signal received")
         watcher.stop()
-        for task in (watcher_task, pm_task, backup_task):
+        for task in (watcher_task, pm_task, scheduler_task, backup_task):
             task.cancel()
             try:
                 await task
