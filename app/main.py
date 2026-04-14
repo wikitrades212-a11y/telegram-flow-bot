@@ -106,7 +106,50 @@ def _seconds_until_830() -> float:
     return (target - now).total_seconds()
 
 
-# ── Source channel matcher ────────────────────────────────────────────────────
+# ── Channel ID helpers ────────────────────────────────────────────────────────
+
+def _normalize_chat_id(value: str) -> str:
+    """Return a comparable string key: numeric IDs stripped of leading zeros,
+    @usernames lowercased."""
+    v = value.strip()
+    if v.startswith("@"):
+        return v.lower()
+    try:
+        return str(int(v))   # normalise -1001234 == -1001234
+    except ValueError:
+        return v.lower()
+
+
+def _validate_channel_routing() -> None:
+    """
+    Fail fast if SOURCE_CHANNEL overlaps with DEST_CHANNEL or INTEL_CHANNEL.
+    Logs all three resolved values so misconfigs are obvious in the startup log.
+    """
+    src   = _normalize_chat_id(config.SOURCE_CHANNEL)
+    dest  = _normalize_chat_id(config.DEST_CHANNEL)
+    intel = _normalize_chat_id(config.INTEL_CHANNEL) if config.INTEL_CHANNEL else None
+
+    logger.info(
+        "Channel routing | SOURCE=%s  DEST=%s  INTEL=%s",
+        src, dest, intel or "(disabled)",
+    )
+
+    if src == dest:
+        raise EnvironmentError(
+            f"ROUTING ERROR: SOURCE_CHANNEL and DEST_CHANNEL are the same ({src}). "
+            "Bot output would loop back into the source. Fix your .env."
+        )
+    if intel and src == intel:
+        raise EnvironmentError(
+            f"ROUTING ERROR: SOURCE_CHANNEL and INTEL_CHANNEL are the same ({src}). "
+            "Intel posts would loop back into the source. Fix your .env."
+        )
+    if intel and intel == dest:
+        logger.warning(
+            "ROUTING WARNING: INTEL_CHANNEL and DEST_CHANNEL are the same (%s). "
+            "Both intel posts and batch reports go to the same channel.", intel
+        )
+
 
 def _is_source_channel(chat) -> bool:
     src = config.SOURCE_CHANNEL.strip()
@@ -194,6 +237,7 @@ async def _price_check_task(
 async def main() -> None:
     _setup_logging()
     validate_env()
+    _validate_channel_routing()
 
     market     = MarketDataService(
         cache_ttl_seconds=config.MARKET_DATA_CACHE_TTL,
@@ -207,13 +251,25 @@ async def main() -> None:
 
     # ── Send helpers ──────────────────────────────────────────────────────────
 
+    _src_id  = _normalize_chat_id(config.SOURCE_CHANNEL)
+    _dest_id = _normalize_chat_id(config.DEST_CHANNEL)
+    _intel_id = _normalize_chat_id(config.INTEL_CHANNEL) if config.INTEL_CHANNEL else None
+
     async def post_to_b(text: str, label: str = "") -> None:
-        """Send a NEW plain-text message to Channel B. Never forwards."""
+        """Send a NEW plain-text message to Channel B. Never forwards. Never writes to source."""
         if not text:
             logger.warning("post_to_b called with empty text | label=%s", label)
             return
+        # Guard: refuse to send Channel B output into the source channel
+        if _dest_id == _src_id:
+            logger.error(
+                "ROUTING GUARD: post_to_b aborted — DEST_CHANNEL equals SOURCE_CHANNEL (%s). "
+                "This would create a feedback loop. Check your .env.",
+                _dest_id,
+            )
+            return
         logger.info(
-            "Sending to Channel B | dest=%s | label=%s | chars=%d",
+            "post_to_b → chat_id=%s | label=%s | chars=%d",
             config.DEST_CHANNEL, label or "?", len(text),
         )
         try:
@@ -235,13 +291,28 @@ async def main() -> None:
     async def post_to_a(text: str, signal_id: str = "") -> None:
         if not config.INTEL_CHANNEL:
             return
+        # Guard: refuse to write intel back into source channel
+        if _intel_id == _src_id:
+            logger.error(
+                "ROUTING GUARD: post_to_a aborted — INTEL_CHANNEL equals SOURCE_CHANNEL (%s). "
+                "Check your .env.",
+                _intel_id,
+            )
+            return
+        logger.info(
+            "post_to_a → chat_id=%s | signal=%s",
+            config.INTEL_CHANNEL, signal_id or "?",
+        )
         try:
             await application.bot.send_message(
                 chat_id=config.INTEL_CHANNEL,
                 text=text,
             )
         except Exception as exc:
-            logger.warning("Channel A send FAILED | signal=%s | error: %s", signal_id or "?", exc)
+            logger.warning(
+                "Channel A (intel) send FAILED | chat_id=%s | signal=%s | error: %s",
+                config.INTEL_CHANNEL, signal_id or "?", exc,
+            )
 
     # ── GO callback for watcher ───────────────────────────────────────────────
 
