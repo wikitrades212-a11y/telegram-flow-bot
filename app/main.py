@@ -17,7 +17,9 @@ Flow:
 """
 
 import asyncio
+import hashlib
 import logging
+import re
 import signal
 import sys
 import uuid
@@ -48,7 +50,7 @@ from app.telegram_handler import (
     format_stats,
 )
 from app.intel_parser import is_aggregated_report, parse_intel_report
-from app.scheduler import Scheduler, SignalWindow
+from app.scheduler import Scheduler, SignalWindow, _slot_key
 from app.classifier import classify_flow
 from app.intel_formatter import format_intel
 from app.batch import BatchStore
@@ -162,6 +164,76 @@ def _is_source_channel(chat) -> bool:
         return False
 
 
+# ── Duplicate guard ───────────────────────────────────────────────────────────
+
+def _fingerprint(text: str) -> str:
+    """Stable hash of normalised text."""
+    normalized = re.sub(r"[ \t]+", " ", text.strip())
+    normalized = normalized.replace("\r\n", "\n").replace("\r", "\n")
+    normalized = re.sub(r"\n{3,}", "\n\n", normalized)
+    return hashlib.sha256(normalized.encode()).hexdigest()[:16]
+
+
+class DuplicateGuard:
+    """
+    Suppresses duplicate Channel B sends.
+
+    - SCHEDULED_* labels  → slot-keyed: same fingerprint in same 30-min slot = duplicate
+    - AGGREGATED_* labels → time-keyed: same fingerprint within cooldown window = duplicate
+    - All other labels    → not checked (GO alerts, HOLD, etc. always pass through)
+    """
+
+    _AGGREGATED_COOLDOWN = timedelta(minutes=10)
+
+    def __init__(self) -> None:
+        # slot_key → last fingerprint sent
+        self._slot_fp:   dict[str, str]      = {}
+        # fingerprint → timestamp of last send (for aggregated cooldown)
+        self._recent_fp: dict[str, datetime] = {}
+
+    def check(self, text: str, label: str) -> tuple[bool, str]:
+        """
+        Returns (should_send: bool, reason: str).
+        reason is one of: SENT | SKIPPED_DUPLICATE | SKIPPED_ALREADY_COVERED
+        """
+        fp = _fingerprint(text)
+        now = _now_et()
+
+        if label.startswith("SCHEDULED_"):
+            slot = _slot_key(now)
+            if self._slot_fp.get(slot) == fp:
+                return False, "SKIPPED_DUPLICATE"
+            # Different fingerprint in same slot — check if slot was already covered
+            if slot in self._slot_fp:
+                return False, "SKIPPED_ALREADY_COVERED"
+            return True, "SENT"
+
+        if label.startswith("AGGREGATED_"):
+            last_sent = self._recent_fp.get(fp)
+            if last_sent and (now - last_sent) < self._AGGREGATED_COOLDOWN:
+                return False, "SKIPPED_DUPLICATE"
+            return True, "SENT"
+
+        return True, "SENT"
+
+    def record(self, text: str, label: str) -> None:
+        """Call after a successful send to update internal state."""
+        fp  = _fingerprint(text)
+        now = _now_et()
+        if label.startswith("SCHEDULED_"):
+            self._slot_fp[_slot_key(now)] = fp
+            # Prune slots older than 12 h
+            cutoff = (now - timedelta(hours=12)).strftime("%Y-%m-%d_%H:%M")
+            self._slot_fp = {k: v for k, v in self._slot_fp.items() if k >= cutoff}
+        if label.startswith("AGGREGATED_"):
+            self._recent_fp[fp] = now
+            # Prune fingerprints older than cooldown
+            self._recent_fp = {
+                k: v for k, v in self._recent_fp.items()
+                if (now - v) < self._AGGREGATED_COOLDOWN * 2
+            }
+
+
 # ── Pre-market tracker ────────────────────────────────────────────────────────
 
 class PremarketTracker:
@@ -248,6 +320,7 @@ async def main() -> None:
     batch      = BatchStore(trigger_count=config.BATCH_SIGNAL_COUNT)
     pm_tracker = PremarketTracker()
     sig_window = SignalWindow(window_minutes=30)
+    dedup      = DuplicateGuard()
 
     application = Application.builder().token(config.BOT_TOKEN).build()
 
@@ -273,8 +346,18 @@ async def main() -> None:
                 _dest_id,
             )
             return
+
+        # ── Duplicate suppression ─────────────────────────────────────────────
+        should_send, reason = dedup.check(text, label)
+        if not should_send:
+            logger.info(
+                "Channel B send %s | label=%s | fp=%s",
+                reason, label or "?", _fingerprint(text),
+            )
+            return
+
         logger.info(
-            "post_to_b → chat_id=%s | label=%s | chars=%d",
+            "post_to_b → chat_id=%s | label=%s | chars=%d | status=SENT",
             config.DEST_CHANNEL, label or "?", len(text),
         )
         try:
@@ -282,6 +365,7 @@ async def main() -> None:
                 chat_id=config.DEST_CHANNEL,
                 text=text,
             )
+            dedup.record(text, label)
             logger.info(
                 "Channel B send OK | tg_msg_id=%d | label=%s",
                 sent.message_id, label or "?",
