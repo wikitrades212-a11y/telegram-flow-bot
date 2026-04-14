@@ -82,6 +82,10 @@ class BatchStore:
         logger.info("Batch firing | %d signals", len(entries))
         return _analyze(entries)
 
+    def analyze_peek(self) -> dict:
+        """Analyze current entries without clearing."""
+        return _analyze(list(self._entries))
+
     def size(self) -> int:
         return len(self._entries)
 

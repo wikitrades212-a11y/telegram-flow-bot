@@ -48,13 +48,19 @@ from app.telegram_handler import (
     format_aggregated_report_b,
     format_batch_report,
     format_stats,
+    format_flow_summary,
+    format_bias_only,
+    format_single_future_plan,
+    format_hot_options,
+    _TECH_TICKERS,
+    _INDEX_HEDGE_TICKERS,
 )
 from app.intel_parser import is_aggregated_report, parse_intel_report
 from app.rs_engine import compute_rs
 from app.scheduler import Scheduler, SignalWindow, _slot_key
 from app.classifier import classify_flow
 from app.intel_formatter import format_intel
-from app.batch import BatchStore
+from app.batch import BatchStore, _analyze
 from app.storage import (
     init_db, was_sent, mark_sent,
     record_signal, update_signal_go, update_price_check,
@@ -263,6 +269,13 @@ class PremarketTracker:
             return {}
         return self._batch.analyze_and_reset()
 
+    def peek(self) -> dict:
+        """Return current analysis without clearing the accumulator."""
+        self._maybe_reset()
+        if self._batch.size() == 0:
+            return {}
+        return self._batch.analyze_peek()
+
     def overnight_notes(self) -> list[str]:
         notes = []
         for ticker, count in self._ticker_counts.most_common(3):
@@ -459,6 +472,375 @@ async def main() -> None:
             await update.message.reply_text("Error running stats. Check logs.")
 
     application.add_handler(CommandHandler("stats", stats_command))
+
+    # ── On-demand command layer ───────────────────────────────────────────────
+    #
+    # Coexists with the automatic scan pipeline.  All commands reply to the
+    # requesting chat; /report also caches output for /last.
+    #
+    # Permission model: if ALLOWED_USERS is set, only listed user IDs may
+    # trigger commands.  If it is empty, any user who can message the bot
+    # is allowed (suitable for private bots).
+
+    _report_cache: dict = {"text": "", "label": "", "ts": None}
+
+    def _is_allowed(update: Update) -> bool:
+        if not config.ALLOWED_USERS:
+            return True
+        user = update.effective_user
+        return user is not None and user.id in config.ALLOWED_USERS
+
+    async def _deny(update: Update) -> None:
+        await update.message.reply_text("Not authorized.")
+
+    # ── /report — force fresh scan → full structured report ───────────────────
+
+    async def cmd_report(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not _is_allowed(update):
+            await _deny(update); return
+        await update.message.reply_text("Scanning… building fresh report.")
+        try:
+            entries = sig_window.fresh()
+            if entries:
+                analysis = _analyze(entries)
+                tickers  = list(dict.fromkeys(e.ticker for e in entries))[:5]
+                rs_data  = await compute_rs(
+                    market,
+                    analysis.get("direction", "NEUTRAL"),
+                    analysis.get("confidence", 0),
+                    tickers,
+                )
+                report = format_channel_b_report(analysis, rs_data=rs_data)
+            else:
+                rs_data = await compute_rs(market, "NEUTRAL", 0, [])
+                report  = ""
+
+            if not report:
+                now_str = _now_et().strftime("%H:%M")
+                rtype   = "PREMARKET" if _is_premarket() else "MARKET"
+                lines   = [f"{rtype} SNAPSHOT — {now_str} ET", "- No signals in current window"]
+                if rs_data and rs_data.data_ok and rs_data.indices.data_ok:
+                    idx = rs_data.indices
+                    def _pos(v):
+                        return "above VWAP" if v else ("below VWAP" if v is False else "N/A")
+                    lines.append(
+                        f"SPY {_pos(idx.spy_above_vwap)}"
+                        f" · QQQ {_pos(idx.qqq_above_vwap)}"
+                        f" · IWM {_pos(idx.iwm_above_vwap)}"
+                    )
+                    lines.append(f"State: {rs_data.market_state}")
+                report = "\n".join(lines)
+
+            _report_cache["text"]  = report
+            _report_cache["label"] = "MANUAL_REPORT"
+            _report_cache["ts"]    = _now_et()
+            await update.message.reply_text(report)
+        except Exception as exc:
+            logger.error("/report command failed: %s", exc, exc_info=True)
+            await update.message.reply_text("Report generation failed. Check logs.")
+
+    # ── /premarket — pre-market bias without clearing the accumulator ──────────
+
+    async def cmd_premarket(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not _is_allowed(update):
+            await _deny(update); return
+        try:
+            analysis = pm_tracker.peek()        # non-destructive; scheduled 8:30 still fires
+            notes    = pm_tracker.overnight_notes()
+            report   = format_premarket_report(analysis, overnight_notes=notes)
+            await update.message.reply_text(report)
+        except Exception as exc:
+            logger.error("/premarket command failed: %s", exc, exc_info=True)
+            await update.message.reply_text("Premarket report failed. Check logs.")
+
+    # ── /flow — options-flow summary of current window ─────────────────────────
+
+    async def cmd_flow(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not _is_allowed(update):
+            await _deny(update); return
+        try:
+            entries = sig_window.fresh()
+            report  = format_flow_summary(entries)
+            await update.message.reply_text(report)
+        except Exception as exc:
+            logger.error("/flow command failed: %s", exc, exc_info=True)
+            await update.message.reply_text("Flow summary failed. Check logs.")
+
+    # ── /bias — market bias only ───────────────────────────────────────────────
+
+    async def cmd_bias(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not _is_allowed(update):
+            await _deny(update); return
+        try:
+            entries  = sig_window.fresh()
+            analysis = _analyze(entries) if entries else {}
+            tickers  = list(dict.fromkeys(e.ticker for e in entries))[:5] if entries else []
+            direction  = analysis.get("direction", "NEUTRAL") if analysis else "NEUTRAL"
+            confidence = analysis.get("confidence", 0) if analysis else 0
+            rs_data  = await compute_rs(market, direction, confidence, tickers)
+            report   = format_bias_only(analysis, rs_data=rs_data)
+            await update.message.reply_text(report)
+        except Exception as exc:
+            logger.error("/bias command failed: %s", exc, exc_info=True)
+            await update.message.reply_text("Bias report failed. Check logs.")
+
+    # ── /nq /es /rty /ym — single-future execution plan ───────────────────────
+
+    async def _cmd_single_future(future: str, update: Update) -> None:
+        if not _is_allowed(update):
+            await _deny(update); return
+        try:
+            entries  = sig_window.fresh()
+            analysis = _analyze(entries) if entries else {}
+            direction  = analysis.get("direction", "NEUTRAL") if analysis else "NEUTRAL"
+            confidence = analysis.get("confidence", 0) if analysis else 0
+            rs_data  = await compute_rs(market, direction, confidence, [])
+            report   = format_single_future_plan(future, rs_data, direction, confidence)
+            await update.message.reply_text(report)
+        except Exception as exc:
+            logger.error("/%s command failed: %s", future.lower(), exc, exc_info=True)
+            await update.message.reply_text(f"{future.upper()} plan failed. Check logs.")
+
+    async def cmd_nq(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        await _cmd_single_future("NQ", update)
+
+    async def cmd_es(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        await _cmd_single_future("ES", update)
+
+    async def cmd_rty(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        await _cmd_single_future("RTY", update)
+
+    async def cmd_ym(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        await _cmd_single_future("YM", update)
+
+    # ── Shared helper: fetch fresh entries + RS direction for filter commands ────
+    #
+    # Short cache (45 s) prevents redundant sig_window reads when several filter
+    # commands are called in quick succession.
+
+    _flow_cache: dict = {
+        "entries":    [],
+        "direction":  "NEUTRAL",
+        "confidence": 0,
+        "ts":         None,
+    }
+    _FLOW_CACHE_TTL = 45   # seconds
+
+    async def _fresh_entries_and_direction() -> tuple[list, str, int]:
+        """
+        Return (entries, direction, confidence) from the current signal window.
+        Result is cached for _FLOW_CACHE_TTL seconds to avoid redundant rescans
+        when multiple filter commands are called back-to-back.
+        """
+        now = _now_et()
+        ts  = _flow_cache["ts"]
+        if ts is not None and (now - ts).total_seconds() < _FLOW_CACHE_TTL:
+            return (
+                _flow_cache["entries"],
+                _flow_cache["direction"],
+                _flow_cache["confidence"],
+            )
+
+        entries    = sig_window.fresh()
+        analysis   = _analyze(entries) if entries else {}
+        direction  = analysis.get("direction", "NEUTRAL") if analysis else "NEUTRAL"
+        confidence = analysis.get("confidence", 0) if analysis else 0
+
+        _flow_cache["entries"]    = entries
+        _flow_cache["direction"]  = direction
+        _flow_cache["confidence"] = confidence
+        _flow_cache["ts"]         = now
+
+        return entries, direction, confidence
+
+    # ── /options — all hot contracts, max 2 per ticker ─────────────────────────
+
+    async def cmd_options(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not _is_allowed(update):
+            await _deny(update); return
+        try:
+            entries, direction, _ = await _fresh_entries_and_direction()
+            report = format_hot_options(
+                entries,
+                filter_fn=None,
+                label="HOT OPTIONS",
+                direction=direction,
+                max_per_ticker=2,
+            )
+            await update.message.reply_text(report)
+        except Exception as exc:
+            logger.error("/options command failed: %s", exc, exc_info=True)
+            await update.message.reply_text("Options scan failed. Check logs.")
+
+    # ── /bulls — bullish (CALL) hot contracts, max 1 per ticker ───────────────
+
+    async def cmd_bulls(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not _is_allowed(update):
+            await _deny(update); return
+        try:
+            entries, direction, _ = await _fresh_entries_and_direction()
+            report = format_hot_options(
+                entries,
+                filter_fn=lambda e: getattr(e, "side", "") == "CALL",
+                label="HOT OPTIONS — BULLS",
+                direction=direction,
+                max_per_ticker=1,
+            )
+            await update.message.reply_text(report)
+        except Exception as exc:
+            logger.error("/bulls command failed: %s", exc, exc_info=True)
+            await update.message.reply_text("Bulls scan failed. Check logs.")
+
+    # ── /bears — bearish (PUT) hot contracts, max 1 per ticker ────────────────
+
+    async def cmd_bears(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not _is_allowed(update):
+            await _deny(update); return
+        try:
+            entries, direction, _ = await _fresh_entries_and_direction()
+            report = format_hot_options(
+                entries,
+                filter_fn=lambda e: getattr(e, "side", "") == "PUT",
+                label="HOT OPTIONS — BEARS",
+                direction=direction,
+                max_per_ticker=1,
+            )
+            await update.message.reply_text(report)
+        except Exception as exc:
+            logger.error("/bears command failed: %s", exc, exc_info=True)
+            await update.message.reply_text("Bears scan failed. Check logs.")
+
+    # ── /tech — tech-sector hot contracts, max 1 per ticker ───────────────────
+
+    async def cmd_tech(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not _is_allowed(update):
+            await _deny(update); return
+        try:
+            entries, direction, _ = await _fresh_entries_and_direction()
+            report = format_hot_options(
+                entries,
+                filter_fn=lambda e: getattr(e, "ticker", "") in _TECH_TICKERS,
+                label="HOT OPTIONS — TECH",
+                direction=direction,
+                max_per_ticker=1,
+            )
+            await update.message.reply_text(report)
+        except Exception as exc:
+            logger.error("/tech command failed: %s", exc, exc_info=True)
+            await update.message.reply_text("Tech scan failed. Check logs.")
+
+    # ── /hedges — index PUT hedges (SPY / QQQ / IWM puts), max 1 per ticker ───
+
+    async def cmd_hedges(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not _is_allowed(update):
+            await _deny(update); return
+        try:
+            entries, direction, _ = await _fresh_entries_and_direction()
+            report = format_hot_options(
+                entries,
+                filter_fn=lambda e: (
+                    getattr(e, "ticker", "") in _INDEX_HEDGE_TICKERS
+                    and getattr(e, "side", "") == "PUT"
+                ),
+                label="INDEX HEDGES",
+                direction=direction,
+                max_per_ticker=1,
+            )
+            await update.message.reply_text(report)
+        except Exception as exc:
+            logger.error("/hedges command failed: %s", exc, exc_info=True)
+            await update.message.reply_text("Hedges scan failed. Check logs.")
+
+    # ── /techbulls — bullish tech contracts only, max 1 per ticker ────────────
+
+    async def cmd_techbulls(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not _is_allowed(update):
+            await _deny(update); return
+        try:
+            entries, direction, _ = await _fresh_entries_and_direction()
+            report = format_hot_options(
+                entries,
+                filter_fn=lambda e: (
+                    getattr(e, "ticker", "") in _TECH_TICKERS
+                    and getattr(e, "side", "") == "CALL"
+                ),
+                label="HOT OPTIONS — TECH BULLS",
+                direction=direction,
+                max_per_ticker=1,
+            )
+            await update.message.reply_text(report)
+        except Exception as exc:
+            logger.error("/techbulls command failed: %s", exc, exc_info=True)
+            await update.message.reply_text("Tech bulls scan failed. Check logs.")
+
+    # ── /techbears — bearish tech contracts only, max 1 per ticker ────────────
+
+    async def cmd_techbears(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not _is_allowed(update):
+            await _deny(update); return
+        try:
+            entries, direction, _ = await _fresh_entries_and_direction()
+            report = format_hot_options(
+                entries,
+                filter_fn=lambda e: (
+                    getattr(e, "ticker", "") in _TECH_TICKERS
+                    and getattr(e, "side", "") == "PUT"
+                ),
+                label="HOT OPTIONS — TECH BEARS",
+                direction=direction,
+                max_per_ticker=1,
+            )
+            await update.message.reply_text(report)
+        except Exception as exc:
+            logger.error("/techbears command failed: %s", exc, exc_info=True)
+            await update.message.reply_text("Tech bears scan failed. Check logs.")
+
+    # ── /last — return most recent cached report ───────────────────────────────
+
+    async def cmd_last(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not _is_allowed(update):
+            await _deny(update); return
+        text = _report_cache.get("text", "")
+        ts   = _report_cache.get("ts")
+        if not text:
+            await update.message.reply_text("No cached report yet. Run /report first.")
+            return
+        ts_str = ts.strftime("%Y-%m-%d %H:%M ET") if ts else "unknown time"
+        await update.message.reply_text(f"[Cached {ts_str}]\n\n{text}")
+
+    # ── Register manual command handlers ──────────────────────────────────────
+
+    for _cmd, _fn in [
+        # Filtered flow commands
+        ("options",    cmd_options),
+        ("bulls",      cmd_bulls),
+        ("bears",      cmd_bears),
+        ("tech",       cmd_tech),
+        ("techbulls",  cmd_techbulls),
+        ("techbears",  cmd_techbears),
+        ("hedges",     cmd_hedges),
+        # Full reports
+        ("report",     cmd_report),
+        ("premarket",  cmd_premarket),
+        ("flow",       cmd_flow),
+        ("bias",       cmd_bias),
+        # Futures
+        ("nq",         cmd_nq),
+        ("es",         cmd_es),
+        ("rty",        cmd_rty),
+        ("ym",         cmd_ym),
+        # Cache
+        ("last",       cmd_last),
+    ]:
+        application.add_handler(CommandHandler(_cmd, _fn))
+
+    logger.info(
+        "Manual command handlers registered: "
+        "/options /bulls /bears /tech /techbulls /techbears /hedges "
+        "/report /premarket /flow /bias "
+        "/nq /es /rty /ym /last | allowed_users=%s",
+        config.ALLOWED_USERS or "all",
+    )
 
     # ── Channel A handler ─────────────────────────────────────────────────────
 

@@ -43,6 +43,26 @@ def _fmt_p(usd: float) -> str:
 
 _MARKET_TICKERS = {"SPY", "QQQ", "IWM", "SPX", "NDX", "DIA"}
 
+# Tech tickers for /tech filter — ETFs + mega-cap + semis + cloud/cyber
+_TECH_TICKERS: frozenset[str] = frozenset({
+    # Tech-heavy ETFs / indices
+    "QQQ", "XLK", "SMH", "SOXX", "ARKK",
+    # Mega-cap tech
+    "AAPL", "MSFT", "NVDA", "GOOGL", "GOOG", "META", "AMZN", "TSLA",
+    "AMD", "INTC", "QCOM", "CRM", "ORCL", "AVGO", "AMAT", "MU",
+    "LRCX", "KLAC", "NFLX", "ADBE", "NOW", "INTU", "SNPS", "CDNS",
+    "TXN", "ON", "MRVL", "MPWR",
+    # Cloud / cybersecurity
+    "PANW", "CRWD", "ZS", "FTNT", "NET", "DDOG", "SNOW", "OKTA",
+    "PLTR", "COIN", "HOOD",
+})
+
+# Tickers qualifying as index hedges for /hedges filter (PUT side only)
+_INDEX_HEDGE_TICKERS: frozenset[str] = frozenset({
+    "SPY", "QQQ", "IWM", "SPX", "NDX", "DIA",
+    "SPXU", "SPXS", "SQQQ", "PSQ", "QID",
+})
+
 
 def _contract_score(e, direction: str) -> float:
     """
@@ -1608,6 +1628,457 @@ def format_aggregated_report_b(report, rs_data: Optional["MarketRS"] = None) -> 
         report.top_bulls,
         report.top_bears,
     ))
+
+    return "\n".join(lines)
+
+
+# ── On-demand command formatters ─────────────────────────────────────────────
+
+def _hot_options_score(e, direction: str) -> float:
+    """
+    Composite urgency + quality score for /options ranking.
+    Weights: Vol/OI (primary urgency), premium (size), delta quality,
+    DTE urgency, classification bonus, institutional size, bias alignment.
+
+    Hedge bonus is capped when there is no broader bearish alignment to
+    prevent every index put from auto-ranking above directional plays.
+    """
+    import math
+
+    delta_abs = abs(getattr(e, "delta", 0) or 0)
+    vol_oi    = getattr(e, "vol_oi_ratio", 0) or 0
+    premium   = getattr(e, "premium_usd", 0) or 0
+    dte       = getattr(e, "dte", 0) or 0
+    side      = getattr(e, "side", "")
+    cls       = getattr(e, "classification", "")
+    ticker    = getattr(e, "ticker", "")
+
+    score = 0.0
+
+    # Premium — log scale so a $22M print doesn't fully dominate
+    if premium > 0:
+        score += min(30, math.log10(max(1, premium)) * 4.5)
+
+    # Vol/OI — primary signal of informed / unusual activity
+    if vol_oi >= 20:
+        score += 32
+    elif vol_oi >= 10:
+        score += 26
+    elif vol_oi >= 5:
+        score += 18
+    elif vol_oi >= 2:
+        score += 8
+
+    # Delta quality — prefer near-ATM (0.40–0.65)
+    if 0.40 <= delta_abs <= 0.65:
+        score += 20
+    elif 0.30 <= delta_abs < 0.40 or 0.65 < delta_abs <= 0.75:
+        score += 10
+    elif delta_abs > 0.75:
+        score += 4   # deep ITM: less levered, lower urgency
+
+    # DTE urgency — tighter expiries command attention
+    if 1 <= dte <= 3:
+        score += 20
+    elif 4 <= dte <= 7:
+        score += 15
+    elif 8 <= dte <= 14:
+        score += 10
+    elif 15 <= dte <= 21:
+        score += 4
+
+    # Classification bonus
+    # HEDGE_DIRECTIONAL: full bonus only when broader context confirms it
+    # (bearish direction, or non-index hedge used for sector protection).
+    # Pure index puts without directional confirmation get a reduced bonus so
+    # they don't auto-rank above aligned directional plays.
+    if cls == "HEDGE_DIRECTIONAL":
+        is_index_put = ticker in _INDEX_HEDGE_TICKERS and side == "PUT"
+        if is_index_put and direction != "BEARISH":
+            score += 9    # hedge pressure exists but no thesis alignment — cap it
+        else:
+            score += 22   # directionally confirmed hedge or non-index directional hedge
+    elif cls in ("POSITIONAL_BULL", "POSITIONAL_BEAR"):
+        score += 16
+    elif cls == "SPECULATIVE_DIRECTIONAL":
+        score += 12
+    elif cls == "CONTINUATION_STRONG":
+        score += 8
+    elif cls == "CONTINUATION_WEAK":
+        score += 4
+
+    # Institutional size bonus
+    if premium >= 10_000_000:
+        score += 16
+    elif premium >= 1_000_000:
+        score += 10
+    elif premium >= 500_000:
+        score += 5
+
+    # Bias alignment bonus — separate from classification so hedges don't
+    # double-dip when direction happens to match their PUT side
+    is_index_hedge_put = ticker in _INDEX_HEDGE_TICKERS and side == "PUT"
+    aligned = (direction == "BULLISH" and side == "CALL") or \
+              (direction == "BEARISH" and side == "PUT" and not is_index_hedge_put)
+    if aligned:
+        score += 10
+
+    return score
+
+
+def _action_tag(e, direction: str) -> str:
+    """
+    Derive a concise per-contract action tag for display in /options output.
+
+    Priority order:
+      HEDGE      — HEDGE_DIRECTIONAL classification, or any index-ticker PUT
+      SWEEP      — vol/oi >= 10 AND dte <= 7 (rapid informed order)
+      POSITIONAL — POSITIONAL_BULL / POSITIONAL_BEAR
+      MOMO       — SPECULATIVE_DIRECTIONAL or CONTINUATION_STRONG with directional edge
+      LOWER QUALITY — passed the score floor but none of the above
+    """
+    cls    = getattr(e, "classification", "")
+    side   = getattr(e, "side", "")
+    vol_oi = getattr(e, "vol_oi_ratio", 0) or 0
+    dte    = getattr(e, "dte", 0) or 0
+    ticker = getattr(e, "ticker", "")
+
+    is_index_put = ticker in _INDEX_HEDGE_TICKERS and side == "PUT"
+    if cls == "HEDGE_DIRECTIONAL" or is_index_put:
+        return "HEDGE"
+
+    if vol_oi >= 10 and dte <= 7:
+        return "SWEEP"
+
+    if cls in ("POSITIONAL_BULL", "POSITIONAL_BEAR"):
+        return "POSITIONAL"
+
+    aligned = (direction == "BULLISH" and side == "CALL") or \
+              (direction == "BEARISH" and side == "PUT")
+    if cls in ("SPECULATIVE_DIRECTIONAL", "CONTINUATION_STRONG") and (vol_oi >= 5 or aligned):
+        return "MOMO"
+
+    return "LOWER QUALITY"
+
+
+def _hot_options_quick_take(entries: list, direction: str) -> list[str]:
+    """Generate 2–3 concise quick-take bullets for the /options footer."""
+    if not entries:
+        return ["No notable contracts in current window."]
+
+    bullets: list[str] = []
+
+    calls = [e for e in entries if getattr(e, "side", "") == "CALL"]
+    puts  = [e for e in entries if getattr(e, "side", "") == "PUT"]
+
+    # Bias bullet
+    if len(calls) > len(puts) * 1.5:
+        bullets.append(f"CALL-dominant flow — {len(calls)}C vs {len(puts)}P in filtered set")
+    elif len(puts) > len(calls) * 1.5:
+        bullets.append(f"PUT-dominant flow — {len(puts)}P vs {len(calls)}C in filtered set")
+    else:
+        bullets.append(f"Mixed flow — {len(calls)} calls / {len(puts)} puts")
+
+    # Institutional bullet
+    big = [e for e in entries if getattr(e, "premium_usd", 0) >= 1_000_000]
+    if big:
+        tickers = list(dict.fromkeys(e.ticker for e in big))[:3]
+        bullets.append(f"Institutional size (>$1M): {', '.join(tickers)}")
+
+    # Vol/OI spike bullet
+    extreme = [e for e in entries if getattr(e, "vol_oi_ratio", 0) >= 10]
+    high    = [e for e in entries if getattr(e, "vol_oi_ratio", 0) >= 5]
+    if extreme:
+        tickers = list(dict.fromkeys(e.ticker for e in extreme))[:3]
+        bullets.append(f"Extreme Vol/OI (>10x) — possible informed flow: {', '.join(tickers)}")
+    elif high:
+        tickers = list(dict.fromkeys(e.ticker for e in high))[:3]
+        bullets.append(f"High Vol/OI (>5x): {', '.join(tickers)}")
+
+    # Urgency bullet
+    urgent = [e for e in entries if 1 <= getattr(e, "dte", 99) <= 3]
+    if urgent:
+        tickers = list(dict.fromkeys(e.ticker for e in urgent))[:3]
+        bullets.append(
+            f"Expiry urgency (DTE 1–3): {', '.join(tickers)} — watch for acceleration"
+        )
+
+    return bullets[:3]
+
+
+# Minimum composite score a contract must reach to appear in any /options output
+_HOT_OPTIONS_MIN_SCORE: float = 55.0
+
+
+def format_hot_options(
+    entries: list,
+    filter_fn=None,
+    label: str = "HOT OPTIONS",
+    direction: str = "NEUTRAL",
+    max_n: int = 8,
+    max_per_ticker: int = 2,
+) -> str:
+    """
+    Ranked hot / unusual options contracts for /options /bulls /bears /tech /hedges.
+
+    min_score:      contracts below _HOT_OPTIONS_MIN_SCORE are silently dropped.
+    max_per_ticker: de-duplication cap — highest-scoring contract(s) per ticker kept.
+
+    Output format:
+        HOT OPTIONS
+
+        1. {ticker strike side} | ${premium} | Vol/OI {ratio} | Δ {delta} | DTE {dte} | {bias} [{tag}]
+        2. ...
+
+        Quick Take:
+        - {bullet 1}
+        - {bullet 2}
+        - {bullet 3}
+
+    filter_fn: optional callable(entry) -> bool applied before scoring.
+    Noise and lottery are always excluded before the caller's filter.
+    """
+    # Base exclusions — noise and pure lottery before any filter
+    pool = [
+        e for e in entries
+        if getattr(e, "classification", "") != "LOTTERY"
+        and getattr(e, "signal_role", "") != "NOISE"
+        and 1 <= getattr(e, "dte", 0) <= 30
+    ]
+
+    # Caller-supplied filter (bulls, bears, tech, hedges)
+    if filter_fn is not None:
+        pool = [e for e in pool if filter_fn(e)]
+
+    if not pool:
+        return f"{label}\n\nNo high-quality hot options right now."
+
+    # Score every candidate
+    scored_all = sorted(
+        [(round(_hot_options_score(e, direction), 1), e) for e in pool],
+        key=lambda x: x[0],
+        reverse=True,
+    )
+
+    # Apply minimum score floor
+    scored_all = [(s, e) for s, e in scored_all if s >= _HOT_OPTIONS_MIN_SCORE]
+
+    if not scored_all:
+        return f"{label}\n\nNo high-quality hot options right now."
+
+    # De-duplicate by ticker — keep the top max_per_ticker per ticker by score
+    ticker_count: dict[str, int] = {}
+    top: list = []
+    for s, e in scored_all:
+        ticker = getattr(e, "ticker", "")
+        if ticker_count.get(ticker, 0) < max_per_ticker:
+            top.append((s, e))
+            ticker_count[ticker] = ticker_count.get(ticker, 0) + 1
+        if len(top) >= max_n:
+            break
+
+    lines = [label, ""]
+
+    for i, (_, e) in enumerate(top, 1):
+        ticker  = getattr(e, "ticker", "?")
+        strike  = getattr(e, "strike", 0)
+        side    = getattr(e, "side", "?")
+        premium = getattr(e, "premium_usd", 0)
+        vol_oi  = getattr(e, "vol_oi_ratio", 0)
+        delta_v = getattr(e, "delta", None)
+        dte     = getattr(e, "dte", 0)
+
+        strike_str = f" {strike:.0f}" if strike else ""
+        delta_str  = f"{delta_v:+.2f}" if delta_v is not None else "N/A"
+        bias       = "BULLISH" if side == "CALL" else "BEARISH"
+        tag        = _action_tag(e, direction)
+
+        lines.append(
+            f"{i}. {ticker}{strike_str} {side} | "
+            f"{_fmt_p(premium)} | "
+            f"Vol/OI {vol_oi:.1f}x | "
+            f"\u0394 {delta_str} | "
+            f"DTE {dte} | "
+            f"{bias} [{tag}]"
+        )
+
+    lines.append("")
+    lines.append("Quick Take:")
+    for bullet in _hot_options_quick_take([e for _, e in top], direction):
+        lines.append(f"- {bullet}")
+
+    return "\n".join(lines)
+
+
+def format_flow_summary(entries: list, max_entries: int = 10) -> str:
+    """
+    Concise summary of recent flow signals for /flow command.
+    Uses the same Channel B formatting conventions.
+    """
+    if not entries:
+        return "FLOW SUMMARY\n- No signals in current window."
+
+    total    = len(entries)
+    bulls    = [e for e in entries if e.side == "CALL"]
+    bears    = [e for e in entries if e.side == "PUT"]
+    bull_pct = round(len(bulls) / total * 100)
+    bear_pct = 100 - bull_pct
+
+    lines = [
+        f"FLOW SUMMARY — {total} signal(s) in window",
+        f"Calls {len(bulls)} ({bull_pct}%) · Puts {len(bears)} ({bear_pct}%)",
+        "",
+        "TOP BY PREMIUM",
+    ]
+
+    top = sorted(entries, key=lambda e: getattr(e, "premium_usd", 0), reverse=True)[:max_entries]
+    for e in top:
+        tag     = _tag_for(e)
+        ticker  = getattr(e, "ticker", "?")
+        strike  = getattr(e, "strike", 0)
+        side    = getattr(e, "side", "?")
+        prem    = getattr(e, "premium_usd", 0)
+        vol_oi  = getattr(e, "vol_oi_ratio", 0)
+        dte     = getattr(e, "dte", 0)
+        strike_str = f" {strike:.0f}" if strike else ""
+        lines.append(
+            f"• {ticker}{strike_str}{side[0] if side else ''}  "
+            f"{_fmt_p(prem)}  Vol/OI {vol_oi:.1f}x  DTE {dte}  [{tag}]"
+        )
+
+    return "\n".join(lines)
+
+
+def format_bias_only(analysis: dict, rs_data: Optional["MarketRS"] = None) -> str:
+    """
+    Market bias extract for /bias command.
+    Includes direction, confidence, regime, and VWAP state.
+    """
+    lines = ["MARKET BIAS"]
+
+    if not analysis:
+        lines.append("Flow: No signals in current window")
+    else:
+        direction  = analysis["direction"]
+        bull_pct   = analysis["bull_pct"]
+        bear_pct   = analysis["bear_pct"]
+        confidence = analysis["confidence"]
+        state      = analysis["state"]
+        lines.append(f"Direction: {direction}")
+        lines.append(f"Bull {bull_pct}% / Bear {bear_pct}% | Confidence: {confidence}/100")
+        lines.append(f"Flow state: {state}")
+
+    if rs_data and rs_data.data_ok:
+        idx = rs_data.indices
+
+        def _pos(v: Optional[bool]) -> str:
+            if v is True:  return "above"
+            if v is False: return "below"
+            return "N/A"
+
+        lines.append(f"Market State: {rs_data.market_state}")
+        if idx.data_ok:
+            lines.append(
+                f"SPY {_pos(idx.spy_above_vwap)} VWAP"
+                f" · QQQ {_pos(idx.qqq_above_vwap)} VWAP"
+                f" · IWM {_pos(idx.iwm_above_vwap)} VWAP"
+            )
+            if analysis:
+                direction  = analysis["direction"]
+                confidence = analysis["confidence"]
+                regime = _derive_regime_tag(direction, confidence, rs_data.market_state, idx)
+                if regime:
+                    lines.append(f"Regime: {regime}")
+    else:
+        lines.append("Market data: unavailable")
+
+    return "\n".join(lines)
+
+
+def format_single_future_plan(
+    future: str,
+    rs_data: Optional["MarketRS"],
+    direction: str = "NEUTRAL",
+    confidence: int = 0,
+) -> str:
+    """
+    Concise execution plan for a single index future.
+    Used by /nq /es /rty /ym commands.
+    """
+    fu = future.upper()
+
+    if rs_data is None or not rs_data.data_ok:
+        return f"{fu} PLAN\n- No market data available."
+
+    idx = rs_data.indices
+    if idx is None or not idx.data_ok:
+        return f"{fu} PLAN\n- Index data unavailable."
+
+    market_state = rs_data.market_state
+
+    def _p(v: Optional[float]) -> str:
+        return f"${v:.2f}" if v is not None else "N/A"
+
+    if fu == "NQ":
+        act, why   = _nq_decision(idx, market_state, confidence)
+        ref_ticker = "QQQ"
+        ref_vwap   = idx.qqq_vwap
+        ref_pm_low = idx.qqq_pm_low
+        ref_above  = idx.qqq_above_vwap
+        ref_pct    = idx.qqq_pct_vs_vwap
+    elif fu == "ES":
+        act, why   = _es_decision(idx, market_state, confidence)
+        ref_ticker = "SPY"
+        ref_vwap   = idx.spy_vwap
+        ref_pm_low = idx.spy_pm_low
+        ref_above  = idx.spy_above_vwap
+        ref_pct    = idx.spy_pct_vs_vwap
+    elif fu == "RTY":
+        act, why   = _rty_decision(idx, market_state)
+        ref_ticker = "IWM"
+        ref_vwap   = idx.iwm_vwap
+        ref_pm_low = idx.iwm_pm_low
+        ref_above  = idx.iwm_above_vwap
+        ref_pct    = idx.iwm_pct_vs_vwap
+    elif fu == "YM":
+        act, why   = _ym_decision(idx, market_state)
+        ref_ticker = "SPY"
+        ref_vwap   = idx.spy_vwap
+        ref_pm_low = idx.spy_pm_low
+        ref_above  = idx.spy_above_vwap
+        ref_pct    = idx.spy_pct_vs_vwap
+    else:
+        return f"Unknown future: {fu}"
+
+    vwap_pos = "above" if ref_above else ("below" if ref_above is False else "N/A")
+    pct_str  = f" ({ref_pct:+.2f}%)" if ref_pct is not None else ""
+
+    lines = [
+        f"{fu} EXECUTION PLAN",
+        f"{ref_ticker}: {vwap_pos} VWAP {_p(ref_vwap)}{pct_str}",
+        f"State: {market_state}",
+        "",
+    ]
+
+    if act == "NO TRADE":
+        lines.append("Decision: NO TRADE")
+        lines.append(f"Reason: {why}")
+    elif act == "LONG":
+        lines.append("Decision: LONG")
+        if fu == "RTY":
+            lines.append(
+                f"Trigger: {ref_ticker} holds above {_p(ref_vwap)} VWAP "
+                "with SPY breadth confirming"
+            )
+        elif fu == "YM":
+            lines.append("Trigger: SPY VWAP hold confirms broad non-tech participation")
+        else:
+            lines.append(f"Trigger: {ref_ticker} holds above {_p(ref_vwap)} VWAP")
+        lines.append(f"Stop: {ref_ticker} loses {_p(ref_pm_low)} (PM low)")
+    elif act == "SHORT":
+        lines.append("Decision: SHORT")
+        lines.append(f"Trigger: {ref_ticker} fails to reclaim {_p(ref_vwap)} VWAP")
+        lines.append(f"Stop: {ref_ticker} reclaims {_p(ref_vwap)}")
 
     return "\n".join(lines)
 

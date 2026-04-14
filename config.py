@@ -72,3 +72,12 @@ BATCH_SIGNAL_COUNT: int = int(os.environ.get("BATCH_SIGNAL_COUNT", "3"))
 
 # ── Tradier ───────────────────────────────────────────────────────────────────
 TRADIER_TOKEN: str = os.environ.get("TRADIER_TOKEN", "")
+
+# ── Manual command permissions ────────────────────────────────────────────────
+# Comma-separated Telegram user IDs allowed to run on-demand report commands.
+# Leave empty (unset) to allow any user who can message the bot.
+ALLOWED_USERS: list[int] = [
+    int(uid.strip())
+    for uid in os.environ.get("ALLOWED_USERS", "").split(",")
+    if uid.strip().isdigit()
+]
