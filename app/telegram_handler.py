@@ -232,10 +232,18 @@ def format_channel_b_report(analysis: dict) -> str:
     entries    = analysis.get("entries", [])
 
     # ── Bias line ─────────────────────────────────────────────────────────────
-    bias_emoji = "🟢" if direction == "BULLISH" else "🔴"
+    _LOW_CONFIDENCE = 20
+    effective_direction = "NEUTRAL" if confidence < _LOW_CONFIDENCE else direction
+    if effective_direction == "BULLISH":
+        bias_emoji = "🟢"
+    elif effective_direction == "BEARISH":
+        bias_emoji = "🔴"
+    else:
+        bias_emoji = "⚪"
     context    = f"{subtype} | {state}"
+    conf_note  = " ⚠️ LOW CONFIDENCE" if confidence < _LOW_CONFIDENCE else ""
     lines = [
-        f"{bias_emoji} MARKET BIAS: {direction} WITH {context}",
+        f"{bias_emoji} MARKET BIAS: {effective_direction} WITH {context}{conf_note}",
         f"Bear {bear_pct}% vs Bull {bull_pct}% | Confidence: {confidence}/100",
         "",
     ]
@@ -542,11 +550,22 @@ def format_aggregated_report_b(report) -> str:
     if not report:
         return ""
 
-    bias_emoji = "🟢" if report.direction == "BULLISH" else "🔴"
-    context    = report.context or report.direction
+    _LOW_CONFIDENCE = 20
+    effective_direction = (
+        "NEUTRAL" if report.confidence < _LOW_CONFIDENCE else report.direction
+    )
+    if effective_direction == "BULLISH":
+        bias_emoji = "🟢"
+    elif effective_direction == "BEARISH":
+        bias_emoji = "🔴"
+    else:
+        bias_emoji = "⚪"
+
+    context = report.context or report.direction
+    conf_note = " ⚠️ LOW CONFIDENCE" if report.confidence < _LOW_CONFIDENCE else ""
 
     lines = [
-        f"{bias_emoji} MARKET BIAS: {report.direction} WITH {context}",
+        f"{bias_emoji} MARKET BIAS: {effective_direction} WITH {context}{conf_note}",
         f"Bear {report.bear_pct}% vs Bull {report.bull_pct}% | Confidence: {report.confidence}/100",
         "",
     ]

@@ -632,10 +632,42 @@ async def main() -> None:
         )
 
         try:
-            await asyncio.gather(market.snapshot("SPY"), market.snapshot("QQQ"))
-            logger.info("Market data cache warm")
+            spy_snap, qqq_snap = await asyncio.gather(
+                market.snapshot("SPY"), market.snapshot("QQQ")
+            )
+            if spy_snap.fetch_ok and spy_snap.price:
+                logger.info(
+                    "Alpaca OK | SPY price=%.2f vwap=%.2f pm_high=%.2f pm_low=%.2f",
+                    spy_snap.price,
+                    spy_snap.vwap or 0,
+                    spy_snap.pm_high or 0,
+                    spy_snap.pm_low or 0,
+                )
+            else:
+                logger.error(
+                    "Alpaca FAILED for SPY — fetch_ok=%s price=%s. "
+                    "Check ALPACA_API_KEY and ALPACA_API_SECRET in .env / Railway vars.",
+                    spy_snap.fetch_ok, spy_snap.price,
+                )
+            if qqq_snap.fetch_ok and qqq_snap.price:
+                logger.info(
+                    "Alpaca OK | QQQ price=%.2f vwap=%.2f",
+                    qqq_snap.price, qqq_snap.vwap or 0,
+                )
+            else:
+                logger.error(
+                    "Alpaca FAILED for QQQ — fetch_ok=%s price=%s.",
+                    qqq_snap.fetch_ok, qqq_snap.price,
+                )
+            if spy_snap.fetch_ok and qqq_snap.fetch_ok:
+                logger.info("Alpaca market data confirmed — decision engine will use live prices")
+            else:
+                logger.error(
+                    "Alpaca not returning data — GO decisions will not fire. "
+                    "Signals will stay HOLD until Alpaca is fixed."
+                )
         except Exception as exc:
-            logger.warning("Warm cache failed (non-fatal): %s", exc)
+            logger.error("Alpaca warm cache failed: %s — check credentials", exc)
 
         scheduler = Scheduler(window=sig_window, send_fn=post_to_b)
         _scheduler_ref.append(scheduler)
