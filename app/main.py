@@ -52,6 +52,7 @@ from app.telegram_handler import (
     format_bias_only,
     format_single_future_plan,
     format_hot_options,
+    format_no_flow_snapshot,
     _TECH_TICKERS,
     _INDEX_HEDGE_TICKERS,
 )
@@ -516,20 +517,29 @@ async def main() -> None:
                 report  = ""
 
             if not report:
-                now_str = _now_et().strftime("%H:%M")
-                rtype   = "PREMARKET" if _is_premarket() else "MARKET"
-                lines   = [f"{rtype} SNAPSHOT — {now_str} ET", "- No signals in current window"]
-                if rs_data and rs_data.data_ok and rs_data.indices.data_ok:
-                    idx = rs_data.indices
-                    def _pos(v):
-                        return "above VWAP" if v else ("below VWAP" if v is False else "N/A")
-                    lines.append(
-                        f"SPY {_pos(idx.spy_above_vwap)}"
-                        f" · QQQ {_pos(idx.qqq_above_vwap)}"
-                        f" · IWM {_pos(idx.iwm_above_vwap)}"
-                    )
-                    lines.append(f"State: {rs_data.market_state}")
-                report = "\n".join(lines)
+                from datetime import time as dtime
+                now = _now_et()
+                t, wd = now.time(), now.weekday()
+                if wd >= 5 or t < dtime(7, 0) or t > dtime(20, 0):
+                    session = "CLOSED"
+                elif t < dtime(9, 30):
+                    session = "PREMARKET"
+                elif t < dtime(16, 0):
+                    session = "MARKET"
+                else:
+                    session = "AFTER HOURS"
+
+                sched = _scheduler_ref[0] if _scheduler_ref else None
+                ctx   = sched.context if sched else None
+
+                report = format_no_flow_snapshot(
+                    session_label   = session,
+                    time_str        = now.strftime("%H:%M"),
+                    rs_data         = rs_data,
+                    prior_direction = ctx.direction if ctx else "NEUTRAL",
+                    prior_leaders   = ctx.leaders   if ctx else [],
+                    prior_laggards  = ctx.laggards  if ctx else [],
+                )
 
             _report_cache["text"]  = report
             _report_cache["label"] = "MANUAL_REPORT"

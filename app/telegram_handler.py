@@ -1995,6 +1995,100 @@ def format_bias_only(analysis: dict, rs_data: Optional["MarketRS"] = None) -> st
     return "\n".join(lines)
 
 
+def _interpret_no_flow_stance(market_state: str, idx: "IndexRS") -> str:
+    """Plain-English market read for the no-flow snapshot."""
+    spy_up    = idx.spy_above_vwap
+    qqq_up    = idx.qqq_above_vwap
+    iwm_up    = idx.iwm_above_vwap
+    all_above = spy_up is True  and qqq_up is True  and iwm_up is True
+    all_below = spy_up is False and qqq_up is False and iwm_up is False
+
+    if market_state == "TREND_UP":
+        return "Read: Uptrend intact — no new flow pressure. Watch for VWAP hold."
+    if market_state == "TREND_DOWN":
+        return "Read: Downtrend intact — no counter-flow. Monitor VWAP rejection."
+    if market_state == "ROTATIONAL":
+        return "Read: Rotation active — sector divergence, avoid index-futures entries."
+    # CHOP or unknown
+    if all_above:
+        return "Read: Bullish lean — indices holding VWAP. No directional edge yet."
+    if all_below:
+        return "Read: Bearish lean — indices below VWAP. Flow confirmation needed."
+    return "Read: Mixed positioning. No edge — stand aside."
+
+
+def format_no_flow_snapshot(
+    session_label: str,
+    time_str: str,
+    rs_data: Optional["MarketRS"] = None,
+    prior_direction: str = "NEUTRAL",
+    prior_leaders: Optional[list] = None,
+    prior_laggards: Optional[list] = None,
+) -> str:
+    """
+    Improved snapshot for when there are no signals in the window.
+    Used by cmd_report (with live RS data) and _fmt_snapshot in scheduler
+    (carry-forward context only, no RS).
+
+    Output example:
+        AFTER HOURS SNAPSHOT — 17:30 ET
+        - No signals in last 30 min
+        SPY +0.12% · QQQ +0.31% · IWM -0.08%
+        State: CHOP | Regime: MIXED / UNTRADEABLE
+        Prior bias: BULLISH | Leaders: NVDA, META
+
+        Read: Bullish lean — indices holding VWAP. No directional edge yet.
+    """
+    lines = [f"{session_label} SNAPSHOT — {time_str} ET", "- No signals in last 30 min"]
+
+    if rs_data and rs_data.data_ok and rs_data.indices.data_ok:
+        idx = rs_data.indices
+
+        def _vwap_str(pct: Optional[float], above: Optional[bool]) -> str:
+            if pct is not None:
+                return f"{'+' if pct >= 0 else ''}{pct:.2f}%"
+            if above is True:  return "above VWAP"
+            if above is False: return "below VWAP"
+            return "N/A"
+
+        lines.append(
+            f"SPY {_vwap_str(idx.spy_pct_vs_vwap, idx.spy_above_vwap)}"
+            f" · QQQ {_vwap_str(idx.qqq_pct_vs_vwap, idx.qqq_above_vwap)}"
+            f" · IWM {_vwap_str(idx.iwm_pct_vs_vwap, idx.iwm_above_vwap)}"
+        )
+
+        regime = _derive_regime_tag("NEUTRAL", 0, rs_data.market_state, idx)
+        lines.append(f"State: {rs_data.market_state} | Regime: {regime}")
+
+        carry_parts: list[str] = []
+        if prior_direction and prior_direction != "NEUTRAL":
+            carry_parts.append(f"Prior bias: {prior_direction}")
+        if prior_leaders:
+            carry_parts.append(f"Leaders: {', '.join(prior_leaders)}")
+        if prior_laggards:
+            carry_parts.append(f"Laggards: {', '.join(prior_laggards)}")
+        if carry_parts:
+            lines.append(" | ".join(carry_parts))
+
+        lines.append("")
+        lines.append(_interpret_no_flow_stance(rs_data.market_state, idx))
+
+    else:
+        # No RS data — carry-forward context + generic read
+        carry_parts = []
+        if prior_direction and prior_direction != "NEUTRAL":
+            carry_parts.append(f"Prior bias: {prior_direction}")
+        if prior_leaders:
+            carry_parts.append(f"Leaders: {', '.join(prior_leaders)}")
+        if prior_laggards:
+            carry_parts.append(f"Laggards: {', '.join(prior_laggards)}")
+        if carry_parts:
+            lines.append(" | ".join(carry_parts))
+        lines.append("Read: No clear market structure. Wait for flow confirmation.")
+
+    return "\n".join(lines)
+
+
 def format_single_future_plan(
     future: str,
     rs_data: Optional["MarketRS"],

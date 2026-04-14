@@ -149,29 +149,15 @@ class _Context:
 # ── Snapshot formatter ────────────────────────────────────────────────────────
 
 def _fmt_snapshot(rtype: str, ctx: _Context, slot: str) -> str:
-    time_str = slot.split("_")[-1]   # "09:30"
-    lines = [
-        f"{rtype} SNAPSHOT — {time_str} ET",
-        "- No major new flow in last 30 min",
-    ]
-    if ctx.direction != "NEUTRAL":
-        lines.append(f"- Previous dominant bias: {ctx.direction}")
-    if ctx.leaders:
-        lines.append(f"- Leaders: {', '.join(ctx.leaders)}")
-    if ctx.laggards:
-        lines.append(f"- Laggards: {', '.join(ctx.laggards)}")
-
-    if ctx.direction == "NEUTRAL" or not ctx.leaders:
-        stance = "WAIT"
-    elif ctx.direction == "BULLISH" and len(ctx.leaders) >= 2:
-        stance = "TREND"
-    elif ctx.leaders and ctx.laggards:
-        stance = "HEDGE"
-    else:
-        stance = "WAIT"
-
-    lines.append(f"- Stance: {stance}")
-    return "\n".join(lines)
+    from app.telegram_handler import format_no_flow_snapshot  # lazy — avoids circular import
+    return format_no_flow_snapshot(
+        session_label   = rtype,
+        time_str        = slot.split("_")[-1],
+        rs_data         = None,   # RS not available synchronously in scheduler path
+        prior_direction = ctx.direction,
+        prior_leaders   = ctx.leaders,
+        prior_laggards  = ctx.laggards,
+    )
 
 
 # ── Structured report formatter (from raw BatchEntry list) ───────────────────
@@ -421,6 +407,11 @@ class Scheduler:
         self._manual_slots = {s for s in self._manual_slots if s >= cutoff}
 
     # ── Context update ────────────────────────────────────────────────────────
+
+    @property
+    def context(self) -> _Context:
+        """Read-only access to carry-forward flow context."""
+        return self._ctx
 
     def _update_context(self, entries: list[BatchEntry]) -> None:
         bulls = [e for e in entries if e.side == "CALL"]
