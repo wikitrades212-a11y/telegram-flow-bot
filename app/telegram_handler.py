@@ -194,6 +194,27 @@ def _tag_for(entry) -> str:
     return tag_map.get(cls, cls)
 
 
+# ── Shared spread thresholds (one place — used by all regime/execution logic) ─
+
+class _T:
+    """
+    Spread thresholds shared across regime tag, RTY/YM decisions,
+    confidence scoring, and execution plan.  Edit here; all callers follow.
+    """
+    # QQQ vs IWM: when QQQ outpaces IWM by this much, the tape is tech-concentrated
+    TECH_VS_SMALL_CONCENTRATION: float = 0.50
+    # QQQ vs SPY: proxy for tech dominance vs broad market
+    TECH_VS_BROAD_DOMINANCE:     float = 0.50
+    # SPY vs IWM: small caps materially lagging broad market (defensive risk-off signal)
+    BROAD_VS_SMALL_LAG:          float = 0.25
+    # QQQ leading selloff harder than small caps (tech-led bear signal)
+    TECH_LEADS_DOWN:             float = 0.40
+    # Single-instrument VWAP proximity — "barely above/below" zone
+    VWAP_PROXIMITY:              float = 0.10
+    # QQQ/SPY divergence above which we penalise broad confidence
+    CONFIDENCE_DIV_PENALTY:      float = 0.80
+
+
 # ── Market Regime Tag ─────────────────────────────────────────────────────────
 
 def _derive_regime_tag(
@@ -205,20 +226,30 @@ def _derive_regime_tag(
     """
     Derive one of seven regime labels from flow + VWAP + breadth + concentration.
 
-    Priority order:
-      1. MIXED / UNTRADEABLE  — no data, CHOP, or too-low confidence
-      2. ROTATIONAL CHOP      — market_state == ROTATIONAL
-      3. BROAD TREND UP/DOWN  — aligned flow + all three indices confirm
-      4. NARROW TECH-LED UP/DOWN — tech concentration present
-      5. DEFENSIVE RISK-OFF   — small caps / cyclicals leading weakness
-      6. MIXED / UNTRADEABLE  — fallback
+    ROTATIONAL CHOP vs MIXED / UNTRADEABLE distinction:
+      ROTATIONAL CHOP   — indices are moving with visible rotation between
+                          sectors or size-factors; there IS movement, but no
+                          clean directional edge for index futures.
+                          Requires: market_state == ROTATIONAL (SPY/QQQ on
+                          opposite VWAP sides) AND confidence >= 25.
+      MIXED/UNTRADEABLE — stand-down condition.  No data, CHOP state,
+                          confidence < 20, or a directional flow that cannot
+                          be confirmed by ANY index VWAP reading.
+
+    Priority:
+      1. No data / CHOP / confidence < 20         → MIXED / UNTRADEABLE
+      2. market_state == ROTATIONAL, conf 20–24   → MIXED / UNTRADEABLE
+         market_state == ROTATIONAL, conf >= 25   → ROTATIONAL CHOP
+      3. NEUTRAL direction with some index spread  → ROTATIONAL CHOP
+         NEUTRAL direction with no index spread    → MIXED / UNTRADEABLE
+      4. BULLISH — check concentration / breadth
+      5. BEARISH — check concentration / breadth
+      6. Fallback                                  → MIXED / UNTRADEABLE
     """
     if not indices or not indices.data_ok:
         return "MIXED / UNTRADEABLE"
     if confidence < 20 or market_state in ("CHOP", "NO_DATA"):
         return "MIXED / UNTRADEABLE"
-    if market_state == "ROTATIONAL" or direction == "NEUTRAL":
-        return "ROTATIONAL CHOP"
 
     spy_up  = indices.spy_above_vwap
     qqq_up  = indices.qqq_above_vwap
@@ -227,45 +258,70 @@ def _derive_regime_tag(
     qqq_pct = indices.qqq_pct_vs_vwap or 0.0
     iwm_pct = indices.iwm_pct_vs_vwap or 0.0
 
-    tech_vs_small = qqq_pct - iwm_pct   # +ve = tech outperforming small caps
-    tech_vs_broad = qqq_pct - spy_pct   # +ve = tech outperforming broad market
+    tech_vs_small = qqq_pct - iwm_pct
+    tech_vs_broad = qqq_pct - spy_pct
+    broad_vs_small = spy_pct - iwm_pct
 
+    # ── ROTATIONAL state ──────────────────────────────────────────────────────
+    if market_state == "ROTATIONAL":
+        # True rotation requires visible index divergence (one up, one down)
+        indices_diverge = (spy_up is True and qqq_up is False) or \
+                          (spy_up is False and qqq_up is True)
+        if indices_diverge and confidence >= 25:
+            return "ROTATIONAL CHOP"
+        return "MIXED / UNTRADEABLE"
+
+    # ── NEUTRAL flow ──────────────────────────────────────────────────────────
+    if direction == "NEUTRAL":
+        # Rotational if indices are visibly split; otherwise no edge
+        indices_diverge = (spy_up is True and qqq_up is False) or \
+                          (spy_up is False and qqq_up is True)
+        if indices_diverge and confidence >= 25:
+            return "ROTATIONAL CHOP"
+        return "MIXED / UNTRADEABLE"
+
+    # ── BULLISH flow ──────────────────────────────────────────────────────────
     if direction == "BULLISH":
         if not (spy_up and qqq_up):
+            # SPY or QQQ below VWAP despite bullish flow — no clean read
             return "MIXED / UNTRADEABLE"
-        # Tech concentration: QQQ running > 0.50% harder than IWM, or IWM not confirming
-        if tech_vs_small > 0.50 or iwm_up is False:
+        # Concentration check: tech outrunning small caps beyond threshold
+        if tech_vs_small > _T.TECH_VS_SMALL_CONCENTRATION or iwm_up is False:
             return "NARROW TECH-LED UP"
-        # Broad: all three above VWAP, no major concentration
-        if iwm_up is True and tech_vs_small <= 0.50:
+        if iwm_up is True:
             return "BROAD TREND UP"
-        # IWM data absent but SPY + QQQ aligned with no concentration
-        if iwm_up is None and tech_vs_broad <= 0.40:
+        # IWM data absent: fall back on tech-vs-broad spread
+        if tech_vs_broad <= _T.TECH_VS_BROAD_DOMINANCE:
             return "BROAD TREND UP"
         return "NARROW TECH-LED UP"
 
+    # ── BEARISH flow ──────────────────────────────────────────────────────────
     if direction == "BEARISH":
         if not (spy_up is False and qqq_up is False):
-            # QQQ above VWAP but flow bearish, or mixed VWAP
+            # Only QQQ below while SPY still above: Nasdaq leading the selling
             if qqq_up is False and spy_up is True:
                 return "NARROW TECH-LED DOWN"
             return "MIXED / UNTRADEABLE"
 
-        # Both SPY and QQQ below VWAP
-        # NARROW TECH-LED DOWN: tech leads the selloff hardest
-        if tech_vs_small < -0.40:
+        # Both SPY and QQQ below VWAP — determine character of the selloff
+        # NARROW TECH-LED DOWN: QQQ leading the decline significantly harder
+        #   than small caps (Nasdaq is the epicentre of selling)
+        if tech_vs_small < -_T.TECH_LEADS_DOWN:
             return "NARROW TECH-LED DOWN"
 
-        # DEFENSIVE RISK-OFF: small caps underperforming broad — risk appetite collapsing
-        if iwm_up is False and iwm_pct < spy_pct - 0.20:
+        # DEFENSIVE RISK-OFF: small caps underperforming broad market —
+        #   investors shedding risk/cyclical exposure beyond just tech
+        if iwm_up is False and broad_vs_small > _T.BROAD_VS_SMALL_LAG:
             return "DEFENSIVE RISK-OFF"
 
-        # BROAD TREND DOWN: even, broad weakness across indices
+        # BROAD TREND DOWN: relatively even weakness across all indices
         if iwm_up is False:
             return "BROAD TREND DOWN"
 
-        # IWM still above VWAP despite SPY/QQQ selling — partial or selective
-        return "ROTATIONAL CHOP"
+        # IWM still above VWAP while SPY/QQQ sell — selective, not broad
+        if confidence >= 25:
+            return "ROTATIONAL CHOP"
+        return "MIXED / UNTRADEABLE"
 
     return "MIXED / UNTRADEABLE"
 
@@ -298,8 +354,11 @@ def _nq_decision(
     if market_state == "TREND_UP":
         if not indices.qqq_above_vwap:
             return "NO TRADE", "QQQ below VWAP — tech not confirming upside"
-        if abs(qqq_pct) < 0.10 and confidence < 50:
-            return "NO TRADE", f"QQQ barely above VWAP ({qqq_pct:+.2f}%) with low confidence — wait for clear hold"
+        if abs(qqq_pct) < _T.VWAP_PROXIMITY and confidence < 50:
+            return "NO TRADE", (
+                f"QQQ barely above VWAP ({qqq_pct:+.2f}%) with low confidence"
+                " — wait for clear hold"
+            )
         return "LONG", None
 
     if market_state == "TREND_DOWN":
@@ -325,8 +384,11 @@ def _es_decision(
     if market_state == "TREND_UP":
         if not indices.spy_above_vwap:
             return "NO TRADE", "SPY below VWAP — broad market not confirming"
-        if abs(spy_pct) < 0.10 and confidence < 50:
-            return "NO TRADE", f"SPY near VWAP ({spy_pct:+.2f}%) with low confidence — wait for clear hold"
+        if abs(spy_pct) < _T.VWAP_PROXIMITY and confidence < 50:
+            return "NO TRADE", (
+                f"SPY near VWAP ({spy_pct:+.2f}%) with low confidence"
+                " — wait for clear hold"
+            )
         return "LONG", None
 
     if market_state == "TREND_DOWN":
@@ -344,7 +406,7 @@ def _rty_decision(
     Stricter RTY logic.
     LONG  requires IWM + SPY both above VWAP and small caps not lagging.
     SHORT requires IWM + SPY both below VWAP.
-    NO TRADE when tech is carrying the tape or breadth is unclear.
+    NO TRADE when tech is carrying the tape or breadth is insufficient.
     """
     if indices is None or not indices.data_ok:
         return "NO TRADE", "IWM data unavailable"
@@ -359,22 +421,23 @@ def _rty_decision(
     spy_pct = indices.spy_pct_vs_vwap or 0.0
     iwm_pct = indices.iwm_pct_vs_vwap or 0.0
 
-    tech_vs_small = qqq_pct - iwm_pct   # positive = tech leading, small caps lagging
-    iwm_vs_spy    = spy_pct - iwm_pct    # positive = small caps lagging broad market
+    tech_vs_small  = qqq_pct - iwm_pct   # +ve = tech leading small caps
+    broad_vs_small = spy_pct - iwm_pct   # +ve = small caps lagging broad market
 
     if market_state == "TREND_UP":
         if iwm_up is not True:
             return "NO TRADE", "IWM below VWAP — small caps not confirming upside"
         if spy_up is not True:
             return "NO TRADE", "SPY not above VWAP — broad market not confirmed for RTY"
-        if tech_vs_small > 0.60:
+        if tech_vs_small > _T.TECH_VS_SMALL_CONCENTRATION:
             return "NO TRADE", (
                 f"Tech concentrated — QQQ {qqq_pct:+.2f}% vs VWAP, "
                 f"IWM only {iwm_pct:+.2f}% — small caps not participating"
             )
-        if iwm_vs_spy > 0.50:
+        if broad_vs_small > _T.BROAD_VS_SMALL_LAG:
             return "NO TRADE", (
-                f"Small caps lagging SPY by {iwm_vs_spy:.2f}% — breadth is not broad enough for RTY long"
+                f"Small caps lagging SPY by {broad_vs_small:.2f}%"
+                " — breadth not broad enough for RTY long"
             )
         return "LONG", ""
 
@@ -383,9 +446,6 @@ def _rty_decision(
             return "NO TRADE", "IWM still above VWAP — small caps not confirming downside"
         if spy_up is not False:
             return "NO TRADE", "SPY still above VWAP — wait for broad market confirmation"
-        if iwm_pct < qqq_pct - 0.40:
-            # Small caps leading down harder than tech — strong breadth deterioration
-            pass  # this actually confirms RTY short
         return "SHORT", ""
 
     return "NO TRADE", "Insufficient confirmation"
@@ -410,27 +470,25 @@ def _ym_decision(
     qqq_pct = indices.qqq_pct_vs_vwap or 0.0
     spy_pct = indices.spy_pct_vs_vwap or 0.0
 
-    # Proxy for tech dominance: QQQ running significantly harder than SPY
-    tech_dominance = qqq_pct - spy_pct
+    tech_dominance = qqq_pct - spy_pct   # QQQ running harder than SPY
 
     if market_state == "TREND_UP":
         if spy_up is not True:
             return "NO TRADE", "SPY not above VWAP — Dow proxy not confirming"
-        if tech_dominance > 0.50:
+        if tech_dominance > _T.TECH_VS_BROAD_DOMINANCE:
             return "NO TRADE", (
-                f"Tape driven by tech — QQQ {qqq_pct:+.2f}% vs SPY {spy_pct:+.2f}% vs VWAP. "
-                "No broad Dow/value participation confirmed"
+                f"Tape driven by tech — QQQ {qqq_pct:+.2f}% vs SPY {spy_pct:+.2f}%"
+                " vs VWAP. No broad Dow/value participation confirmed"
             )
         return "LONG", ""
 
     if market_state == "TREND_DOWN":
         if spy_up is not False:
             return "NO TRADE", "SPY still above VWAP — no clear Dow downside signal"
-        # If tech leads down much harder than broad market, Dow (value-heavy) may lag
-        if tech_dominance < -0.50:
+        if tech_dominance < -_T.TECH_VS_BROAD_DOMINANCE:
             return "NO TRADE", (
-                "Tech leading lower harder than broad tape — "
-                "Dow (value/cyclicals) may not follow at the same pace"
+                "Nasdaq leading lower harder than the broad tape —"
+                " Dow (value/cyclicals) may not follow at the same pace"
             )
         return "SHORT", ""
 
@@ -461,7 +519,7 @@ def _compute_structured_confidence(
       +10  no conflicting hedge flow
       -10  multiple hedge entries conflict with direction
       -10  mixed ticker RS (leaders and laggards in same session)
-      -10  broad index/sector internal conflict (QQQ vs SPY diverge > 0.8%)
+      -10  QQQ/SPY diverge > _T.CONFIDENCE_DIV_PENALTY (concentrated tape)
     Clamp: 0–100
     """
     score = 0
@@ -516,7 +574,6 @@ def _compute_structured_confidence(
                 score += 15
             elif confirming == 1:
                 score += 8
-
             if conflicting >= 2:
                 score -= 10  # key leaders explicitly disagree
 
@@ -529,11 +586,11 @@ def _compute_structured_confidence(
         elif hedge_count >= 2:
             score -= 10
 
-        # QQQ / SPY internal divergence — concentrated vs broad
+        # QQQ/SPY divergence penalty — concentrated tape reduces broad confidence
         spy_pct_val = idx.spy_pct_vs_vwap or 0.0
         qqq_pct_val = idx.qqq_pct_vs_vwap or 0.0
-        if abs(qqq_pct_val - spy_pct_val) > 0.80:
-            score -= 10  # tech-concentrated tape conflicts with broad read
+        if abs(qqq_pct_val - spy_pct_val) > _T.CONFIDENCE_DIV_PENALTY:
+            score -= 10
 
     return max(0, min(100, score))
 
