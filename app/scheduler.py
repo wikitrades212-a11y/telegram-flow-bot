@@ -32,6 +32,18 @@ _SCHEDULE_END   = dtime(16, 30)
 _MARKET_OPEN    = dtime(9, 30)
 _MARKET_CLOSE   = dtime(16, 0)
 
+# NYSE holidays — update annually.  Source: NYSE holiday schedule.
+_NYSE_HOLIDAYS: frozenset[str] = frozenset({
+    # 2025
+    "2025-01-01", "2025-01-20", "2025-02-17", "2025-04-18",
+    "2025-05-26", "2025-06-19", "2025-07-04", "2025-09-01",
+    "2025-11-27", "2025-12-25",
+    # 2026
+    "2026-01-01", "2026-01-19", "2026-02-16", "2026-04-03",
+    "2026-05-25", "2026-06-19", "2026-07-03", "2026-09-07",
+    "2026-11-26", "2026-12-25",
+})
+
 _SendFn = Callable[[str, str], Awaitable[None]]   # post_to_b(text, label)
 
 
@@ -49,6 +61,8 @@ def _slot_key(dt: datetime) -> str:
 
 def _in_schedule(dt: datetime) -> bool:
     if dt.weekday() >= 5:
+        return False
+    if dt.strftime("%Y-%m-%d") in _NYSE_HOLIDAYS:
         return False
     t = dt.time().replace(second=0, microsecond=0)
     return _SCHEDULE_START <= t <= _SCHEDULE_END
