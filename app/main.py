@@ -50,6 +50,7 @@ from app.telegram_handler import (
     format_stats,
 )
 from app.intel_parser import is_aggregated_report, parse_intel_report
+from app.rs_engine import compute_rs
 from app.scheduler import Scheduler, SignalWindow, _slot_key
 from app.classifier import classify_flow
 from app.intel_formatter import format_intel
@@ -489,7 +490,13 @@ async def main() -> None:
                 await post_to_b(fallback, label="AGGREGATED_RAW_FALLBACK")
                 return
 
-            formatted = format_aggregated_report_b(report)
+            # Fetch RS data in parallel with any remaining work
+            flow_tickers = list(dict.fromkeys(
+                e.ticker for e in (report.top_overall + report.top_bulls + report.top_bears)
+            ))[:5]
+            rs_data = await compute_rs(market, report.direction, report.confidence, flow_tickers)
+
+            formatted = format_aggregated_report_b(report, rs_data=rs_data)
 
             if not formatted:
                 logger.warning(
@@ -503,10 +510,11 @@ async def main() -> None:
 
             logger.info(
                 "Parser path: AGGREGATED_PARSED | msg_id=%s | direction=%s "
-                "| confidence=%d | top_overall=%d | bulls=%d | bears=%d | chars=%d",
+                "| confidence=%d | top_overall=%d | bulls=%d | bears=%d | chars=%d "
+                "| rs_state=%s",
                 message.message_id, report.direction, report.confidence,
                 len(report.top_overall), len(report.top_bulls), len(report.top_bears),
-                len(formatted),
+                len(formatted), rs_data.market_state,
             )
             await post_to_b(formatted, label="AGGREGATED_PARSED")
             return
@@ -587,13 +595,19 @@ async def main() -> None:
 
         # ── Batch fire → Channel B structured report ──────────────────────────
         if batch.should_post():
-            analysis  = batch.analyze_and_reset()
-            formatted = format_channel_b_report(analysis)
+            analysis = batch.analyze_and_reset()
+            # Fetch RS data for batch report
+            batch_tickers = list(dict.fromkeys(
+                e.ticker for e in analysis.get("entries", [])
+            ))[:5]
+            rs_data  = await compute_rs(market, analysis.get("direction", "NEUTRAL"), analysis.get("confidence", 0), batch_tickers)
+            formatted = format_channel_b_report(analysis, rs_data=rs_data)
             if formatted:
                 await post_to_b(formatted, label="BATCH")
                 logger.info(
-                    "Batch report sent | state=%s | mode=%s | signals=%d",
+                    "Batch report sent | state=%s | mode=%s | signals=%d | rs_state=%s",
                     analysis.get("state"), analysis.get("mode"), analysis.get("total"),
+                    rs_data.market_state,
                 )
             else:
                 logger.warning("format_channel_b_report returned empty string — NOT sent")
@@ -669,7 +683,7 @@ async def main() -> None:
         except Exception as exc:
             logger.error("Alpaca warm cache failed: %s — check credentials", exc)
 
-        scheduler = Scheduler(window=sig_window, send_fn=post_to_b)
+        scheduler = Scheduler(window=sig_window, send_fn=post_to_b, market=market)
         _scheduler_ref.append(scheduler)
 
         watcher_task   = asyncio.create_task(watcher.run())

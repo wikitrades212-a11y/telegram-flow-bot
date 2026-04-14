@@ -16,9 +16,13 @@ Channel B send_message uses NO parse_mode — plain UTF-8.
 """
 
 import re
+from typing import TYPE_CHECKING, Optional
 
 from app.parser import FlowSignal
 from app.decision_engine import Decision
+
+if TYPE_CHECKING:
+    from app.rs_engine import MarketRS, IndexRS
 
 
 # ── Shared helpers ────────────────────────────────────────────────────────────
@@ -190,9 +194,171 @@ def _tag_for(entry) -> str:
     return tag_map.get(cls, cls)
 
 
+# ── Execution plan + Final Verdict ───────────────────────────────────────────
+
+def _fmt_execution_plan(market_state: str, indices: "IndexRS") -> str:
+    """
+    Build EXECUTION PLAN block for NQ, ES, RTY, YM.
+    Returns "" if no usable index data.
+    """
+    if indices is None or not indices.data_ok:
+        return ""
+
+    def _p(v: Optional[float]) -> str:
+        return f"${v:.2f}" if v is not None else "N/A"
+
+    def _plan(future: str, ref: str, above: Optional[bool], vwap: Optional[float], pm_low: Optional[float]) -> list[str]:
+        vp = _p(vwap)
+        sp = _p(pm_low)
+        if above is None:
+            return [f"{future}: NO TRADE — {ref} data unavailable"]
+        if market_state == "TREND_UP" and above:
+            return [
+                f"{future}: LONG",
+                f"  Trigger: {ref} holds above {vp} VWAP",
+                f"  Stop: {ref} loses {sp} (PM low)",
+            ]
+        if market_state == "TREND_DOWN" and not above:
+            return [
+                f"{future}: SHORT",
+                f"  Trigger: {ref} fails to reclaim {vp} VWAP",
+                f"  Stop: {ref} reclaims {vp}",
+            ]
+        if market_state == "ROTATIONAL":
+            return [f"{future}: NO TRADE — rotation, no directional edge"]
+        if market_state == "CHOP":
+            return [f"{future}: NO TRADE — CHOP, wait for VWAP alignment"]
+        return [f"{future}: NO TRADE"]
+
+    lines = ["", "EXECUTION PLAN"]
+    lines += _plan("NQ",  "QQQ", indices.qqq_above_vwap, indices.qqq_vwap, indices.qqq_pm_low)
+    lines += _plan("ES",  "SPY", indices.spy_above_vwap, indices.spy_vwap, indices.spy_pm_low)
+    lines += _plan("RTY", "IWM", indices.iwm_above_vwap, indices.iwm_vwap, indices.iwm_pm_low)
+
+    # YM follows ES direction
+    if market_state == "TREND_UP" and indices.spy_above_vwap:
+        lines += [
+            "YM: LONG (follows ES)",
+            f"  Trigger: SPY VWAP reclaim confirms",
+            f"  Stop: SPY loses {_p(indices.spy_pm_low)}",
+        ]
+    elif market_state == "TREND_DOWN" and indices.spy_above_vwap is False:
+        lines += [
+            "YM: SHORT (follows ES)",
+            f"  Trigger: Bounce into {_p(indices.spy_vwap)} fails",
+            f"  Stop: SPY reclaims {_p(indices.spy_vwap)}",
+        ]
+    else:
+        lines.append("YM: NO TRADE — follows ES")
+
+    return "\n".join(lines)
+
+
+def _fmt_final_verdict(
+    market_state: str,
+    direction: str,
+    confidence: int,
+    rs_data: Optional["MarketRS"],
+    entries_all: list,
+    entries_bull: list,
+    entries_bear: list,
+) -> str:
+    """
+    Build FINAL VERDICT block. Always the last section.
+    """
+    state_label = {
+        "TREND_UP":   "TREND UP",
+        "TREND_DOWN": "TREND DOWN",
+        "ROTATIONAL": "ROTATIONAL",
+        "CHOP":       "CHOP",
+        "NO_DATA":    "UNKNOWN",
+    }.get(market_state, market_state)
+
+    lines = ["", "FINAL VERDICT"]
+    lines.append(f"Market State: {state_label} | Confidence: {confidence}/100")
+
+    # WHY line
+    why_parts: list[str] = []
+    if direction != "NEUTRAL" and entries_all:
+        bull_n = sum(1 for e in entries_all if getattr(e, "side", "") == "CALL")
+        bear_n = len(entries_all) - bull_n
+        pct    = round(bull_n / len(entries_all) * 100) if direction == "BULLISH" else round(bear_n / len(entries_all) * 100)
+        why_parts.append(f"{direction} flow ({pct}%)")
+
+    if rs_data and rs_data.indices.data_ok:
+        idx = rs_data.indices
+        vwap_notes = []
+        if idx.spy_above_vwap is True:
+            vwap_notes.append("SPY above VWAP")
+        elif idx.spy_above_vwap is False:
+            vwap_notes.append("SPY below VWAP")
+        if idx.qqq_above_vwap is True:
+            vwap_notes.append("QQQ above VWAP")
+        elif idx.qqq_above_vwap is False:
+            vwap_notes.append("QQQ below VWAP")
+        if vwap_notes:
+            why_parts.append(", ".join(vwap_notes))
+
+    leaders  = list(dict.fromkeys(getattr(e, "ticker", "") for e in entries_bull[:2] if getattr(e, "ticker", "")))
+    laggards = list(dict.fromkeys(getattr(e, "ticker", "") for e in entries_bear[:2] if getattr(e, "ticker", "")))
+    if leaders:
+        why_parts.append(f"Leaders: {', '.join(leaders)}")
+    if laggards:
+        why_parts.append(f"Laggards: {', '.join(laggards)}")
+
+    if why_parts:
+        lines.append("WHY: " + ". ".join(why_parts) + ".")
+
+    # Compact per-futures lines
+    if rs_data and rs_data.indices.data_ok:
+        idx = rs_data.indices
+
+        def _vp(v):
+            return f"${v:.2f}" if v is not None else "?"
+
+        def _compact(future: str, ref: str, above: Optional[bool], vwap: Optional[float]) -> str:
+            if above is None:
+                return f"{future} → NO DATA"
+            if market_state == "TREND_UP" and above:
+                return f"{future} → LONG | {ref} above {_vp(vwap)}"
+            if market_state == "TREND_DOWN" and not above:
+                return f"{future} → SHORT | {ref} below {_vp(vwap)}"
+            return f"{future} → NO TRADE"
+
+        lines.append(_compact("NQ",  "QQQ", idx.qqq_above_vwap, idx.qqq_vwap))
+        lines.append(_compact("ES",  "SPY", idx.spy_above_vwap, idx.spy_vwap))
+        lines.append(_compact("RTY", "IWM", idx.iwm_above_vwap, idx.iwm_vwap))
+        ym = _compact("ES",  "SPY", idx.spy_above_vwap, idx.spy_vwap)
+        lines.append(ym.replace("ES →", "YM →") + " (follows ES)")
+
+    # DO NOT
+    if market_state == "TREND_UP":
+        do_not = "Short into VWAP strength. Chase breakouts without pullback."
+    elif market_state == "TREND_DOWN":
+        do_not = "Buy weakness without VWAP reclaim. Catch falling knives."
+    elif market_state == "ROTATIONAL":
+        do_not = "Take outright directional futures positions. Use pairs only."
+    else:
+        do_not = "Force trades. No edge in CHOP — wait for VWAP alignment."
+    lines.append(f"DO NOT: {do_not}")
+
+    # KEY READ
+    if market_state == "TREND_UP":
+        key_read = "Growth and tech leading — bias long NQ until QQQ loses VWAP."
+    elif market_state == "TREND_DOWN":
+        key_read = "Selling pressure dominant — fade bounces, protect gains."
+    elif market_state == "ROTATIONAL":
+        key_read = "Sector rotation active — target relative strength, avoid index plays."
+    else:
+        key_read = "No clear edge — reduce size, wait for index VWAP alignment."
+    lines.append(f"KEY READ: {key_read}")
+
+    return "\n".join(lines)
+
+
 # ── Channel B: new structured report ─────────────────────────────────────────
 
-def format_channel_b_report(analysis: dict) -> str:
+def format_channel_b_report(analysis: dict, rs_data: Optional["MarketRS"] = None) -> str:
     """
     Build the new Channel B structured output.
 
@@ -344,6 +510,18 @@ def format_channel_b_report(analysis: dict) -> str:
     actionable_section = _fmt_actionable_section(entries, direction)
     if actionable_section:
         lines.append(actionable_section)
+
+    # ── Execution Plan (RS-powered) ───────────────────────────────────────────
+    if rs_data and rs_data.data_ok:
+        exec_plan = _fmt_execution_plan(rs_data.market_state, rs_data.indices)
+        if exec_plan:
+            lines.append(exec_plan)
+
+    # ── Final Verdict ─────────────────────────────────────────────────────────
+    ms = rs_data.market_state if (rs_data and rs_data.data_ok) else "NO_DATA"
+    bulls_list = sorted([e for e in actionable if e.side == "CALL"], key=lambda e: e.priority)
+    bears_list = sorted([e for e in actionable if e.side == "PUT"],  key=lambda e: e.priority)
+    lines.append(_fmt_final_verdict(ms, effective_direction, confidence, rs_data, actionable, bulls_list, bears_list))
 
     return "\n".join(lines)
 
@@ -539,14 +717,13 @@ def format_stats(s: dict) -> str:
 
 # ── Aggregated intel report → Channel B ──────────────────────────────────────
 
-def format_aggregated_report_b(report) -> str:
+def format_aggregated_report_b(report, rs_data: Optional["MarketRS"] = None) -> str:
     """
     Re-format a parsed IntelReport into the standard Channel B output.
 
     Preserves the intelligence from the upstream aggregated report but
     normalises it into our clean Channel B structure.
     """
-    from app.intel_parser import IntelReport  # local import to avoid circular
     if not report:
         return ""
 
@@ -649,6 +826,24 @@ def format_aggregated_report_b(report) -> str:
     actionable_section = _fmt_actionable_section(all_entries, report.direction)
     if actionable_section:
         lines.append(actionable_section)
+
+    # ── Execution Plan (RS-powered) ───────────────────────────────────────────
+    if rs_data and rs_data.data_ok:
+        exec_plan = _fmt_execution_plan(rs_data.market_state, rs_data.indices)
+        if exec_plan:
+            lines.append(exec_plan)
+
+    # ── Final Verdict ─────────────────────────────────────────────────────────
+    ms = rs_data.market_state if (rs_data and rs_data.data_ok) else "NO_DATA"
+    lines.append(_fmt_final_verdict(
+        ms,
+        effective_direction,
+        report.confidence,
+        rs_data,
+        all_entries,
+        report.top_bulls,
+        report.top_bears,
+    ))
 
     return "\n".join(lines)
 

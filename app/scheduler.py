@@ -21,6 +21,7 @@ from typing import Awaitable, Callable, Optional
 import pytz
 
 from app.batch import BatchEntry, BatchStore, _analyze
+from app.rs_engine import compute_rs, MarketRS
 
 logger = logging.getLogger(__name__)
 
@@ -144,7 +145,12 @@ def _fmt_p(usd: float) -> str:
     return f"${usd:.0f}"
 
 
-def _fmt_structured(rtype: str, entries: list[BatchEntry], slot: str) -> str:
+async def _fmt_structured(
+    rtype: str,
+    entries: list[BatchEntry],
+    slot: str,
+    market=None,
+) -> str:
     """Format a structured report from fresh BatchEntry objects."""
     from app.telegram_handler import format_channel_b_report  # avoid circular at import time
     analysis = _analyze(entries)
@@ -152,7 +158,18 @@ def _fmt_structured(rtype: str, entries: list[BatchEntry], slot: str) -> str:
         return ""
     time_str = slot.split("_")[-1]
     header   = f"{rtype} REPORT — {time_str} ET\n"
-    body     = format_channel_b_report(analysis)
+
+    rs_data = None
+    if market:
+        tickers = list(dict.fromkeys(e.ticker for e in entries))[:5]
+        rs_data = await compute_rs(
+            market,
+            analysis.get("direction", "NEUTRAL"),
+            analysis.get("confidence", 0),
+            tickers,
+        )
+
+    body = format_channel_b_report(analysis, rs_data=rs_data)
     return header + body if body else ""
 
 
@@ -164,9 +181,10 @@ class Scheduler:
     within the 07:00–16:00 ET window on weekdays.
     """
 
-    def __init__(self, window: SignalWindow, send_fn: _SendFn) -> None:
+    def __init__(self, window: SignalWindow, send_fn: _SendFn, market=None) -> None:
         self._window   = window
         self._send     = send_fn
+        self._market   = market   # Optional MarketDataService — enables RS in scheduled reports
         self._ctx      = _Context()
         self._manual_slots: set[str] = set()   # slots where manual send happened
         self._fired_slots:  set[str] = set()   # slots where scheduled report fired
@@ -233,7 +251,7 @@ class Scheduler:
         # Choose format
         MIN_SIGNALS = 1 if rtype == "PREMARKET" else 2
         if len(entries) >= MIN_SIGNALS:
-            text = _fmt_structured(rtype, entries, slot)
+            text = await _fmt_structured(rtype, entries, slot, market=self._market)
             label = f"SCHEDULED_{rtype}"
             if not text:
                 # structured format failed — fall back to snapshot
