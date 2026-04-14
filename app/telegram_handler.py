@@ -194,6 +194,92 @@ def _tag_for(entry) -> str:
     return tag_map.get(cls, cls)
 
 
+# ── Market Regime Tag ─────────────────────────────────────────────────────────
+
+def _derive_regime_tag(
+    direction: str,
+    confidence: int,
+    market_state: str,
+    indices: Optional["IndexRS"],
+) -> str:
+    """
+    Derive one of seven regime labels from flow + VWAP + breadth + concentration.
+
+    Priority order:
+      1. MIXED / UNTRADEABLE  — no data, CHOP, or too-low confidence
+      2. ROTATIONAL CHOP      — market_state == ROTATIONAL
+      3. BROAD TREND UP/DOWN  — aligned flow + all three indices confirm
+      4. NARROW TECH-LED UP/DOWN — tech concentration present
+      5. DEFENSIVE RISK-OFF   — small caps / cyclicals leading weakness
+      6. MIXED / UNTRADEABLE  — fallback
+    """
+    if not indices or not indices.data_ok:
+        return "MIXED / UNTRADEABLE"
+    if confidence < 20 or market_state in ("CHOP", "NO_DATA"):
+        return "MIXED / UNTRADEABLE"
+    if market_state == "ROTATIONAL" or direction == "NEUTRAL":
+        return "ROTATIONAL CHOP"
+
+    spy_up  = indices.spy_above_vwap
+    qqq_up  = indices.qqq_above_vwap
+    iwm_up  = indices.iwm_above_vwap
+    spy_pct = indices.spy_pct_vs_vwap or 0.0
+    qqq_pct = indices.qqq_pct_vs_vwap or 0.0
+    iwm_pct = indices.iwm_pct_vs_vwap or 0.0
+
+    tech_vs_small = qqq_pct - iwm_pct   # +ve = tech outperforming small caps
+    tech_vs_broad = qqq_pct - spy_pct   # +ve = tech outperforming broad market
+
+    if direction == "BULLISH":
+        if not (spy_up and qqq_up):
+            return "MIXED / UNTRADEABLE"
+        # Tech concentration: QQQ running > 0.50% harder than IWM, or IWM not confirming
+        if tech_vs_small > 0.50 or iwm_up is False:
+            return "NARROW TECH-LED UP"
+        # Broad: all three above VWAP, no major concentration
+        if iwm_up is True and tech_vs_small <= 0.50:
+            return "BROAD TREND UP"
+        # IWM data absent but SPY + QQQ aligned with no concentration
+        if iwm_up is None and tech_vs_broad <= 0.40:
+            return "BROAD TREND UP"
+        return "NARROW TECH-LED UP"
+
+    if direction == "BEARISH":
+        if not (spy_up is False and qqq_up is False):
+            # QQQ above VWAP but flow bearish, or mixed VWAP
+            if qqq_up is False and spy_up is True:
+                return "NARROW TECH-LED DOWN"
+            return "MIXED / UNTRADEABLE"
+
+        # Both SPY and QQQ below VWAP
+        # NARROW TECH-LED DOWN: tech leads the selloff hardest
+        if tech_vs_small < -0.40:
+            return "NARROW TECH-LED DOWN"
+
+        # DEFENSIVE RISK-OFF: small caps underperforming broad — risk appetite collapsing
+        if iwm_up is False and iwm_pct < spy_pct - 0.20:
+            return "DEFENSIVE RISK-OFF"
+
+        # BROAD TREND DOWN: even, broad weakness across indices
+        if iwm_up is False:
+            return "BROAD TREND DOWN"
+
+        # IWM still above VWAP despite SPY/QQQ selling — partial or selective
+        return "ROTATIONAL CHOP"
+
+    return "MIXED / UNTRADEABLE"
+
+
+def _fmt_regime_block(
+    direction: str,
+    confidence: int,
+    market_state: str,
+    indices: Optional["IndexRS"],
+) -> str:
+    tag = _derive_regime_tag(direction, confidence, market_state, indices)
+    return f"MARKET REGIME:\n{tag}"
+
+
 # ── Per-instrument decision helpers ──────────────────────────────────────────
 
 def _nq_decision(
@@ -891,6 +977,12 @@ def format_channel_b_report(analysis: dict, rs_data: Optional["MarketRS"] = None
     if actionable_section:
         lines.append(actionable_section)
 
+    # ── Market Regime Tag ─────────────────────────────────────────────────────
+    ms = rs_data.market_state if (rs_data and rs_data.data_ok) else "NO_DATA"
+    regime_indices = rs_data.indices if (rs_data and rs_data.data_ok) else None
+    lines.append("")
+    lines.append(_fmt_regime_block(effective_direction, confidence, ms, regime_indices))
+
     # ── Execution Plan (RS-powered) ───────────────────────────────────────────
     if rs_data and rs_data.data_ok:
         exec_plan = _fmt_execution_plan(
@@ -901,7 +993,6 @@ def format_channel_b_report(analysis: dict, rs_data: Optional["MarketRS"] = None
             lines.append(exec_plan)
 
     # ── Final Verdict ─────────────────────────────────────────────────────────
-    ms         = rs_data.market_state if (rs_data and rs_data.data_ok) else "NO_DATA"
     bulls_list = sorted([e for e in actionable if e.side == "CALL"], key=lambda e: e.priority)
     bears_list = sorted([e for e in actionable if e.side == "PUT"],  key=lambda e: e.priority)
     lines.append(_fmt_final_verdict(
@@ -1213,6 +1304,12 @@ def format_aggregated_report_b(report, rs_data: Optional["MarketRS"] = None) -> 
     if actionable_section:
         lines.append(actionable_section)
 
+    # ── Market Regime Tag ─────────────────────────────────────────────────────
+    ms             = rs_data.market_state if (rs_data and rs_data.data_ok) else "NO_DATA"
+    regime_indices = rs_data.indices if (rs_data and rs_data.data_ok) else None
+    lines.append("")
+    lines.append(_fmt_regime_block(effective_direction, report.confidence, ms, regime_indices))
+
     # ── Execution Plan (RS-powered) ───────────────────────────────────────────
     if rs_data and rs_data.data_ok:
         exec_plan = _fmt_execution_plan(
@@ -1223,7 +1320,6 @@ def format_aggregated_report_b(report, rs_data: Optional["MarketRS"] = None) -> 
             lines.append(exec_plan)
 
     # ── Final Verdict ─────────────────────────────────────────────────────────
-    ms = rs_data.market_state if (rs_data and rs_data.data_ok) else "NO_DATA"
     lines.append(_fmt_final_verdict(
         ms,
         effective_direction,
