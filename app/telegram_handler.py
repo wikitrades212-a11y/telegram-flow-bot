@@ -194,12 +194,275 @@ def _tag_for(entry) -> str:
     return tag_map.get(cls, cls)
 
 
-# ── Execution plan + Final Verdict ───────────────────────────────────────────
+# ── Per-instrument decision helpers ──────────────────────────────────────────
 
-def _fmt_execution_plan(market_state: str, indices: "IndexRS") -> str:
+def _nq_decision(
+    indices: "IndexRS", market_state: str, confidence: int
+) -> tuple[str, Optional[str]]:
+    """Returns (action, reason_or_None). action = LONG | SHORT | NO TRADE."""
+    if indices is None or not indices.data_ok or indices.qqq_above_vwap is None:
+        return "NO TRADE", "QQQ data unavailable"
+    if market_state in ("CHOP", "NO_DATA"):
+        return "NO TRADE", "CHOP — no directional edge in tech"
+    if market_state == "ROTATIONAL":
+        return "NO TRADE", "Rotation — QQQ leadership is unclear"
+
+    qqq_pct = indices.qqq_pct_vs_vwap or 0.0
+
+    if market_state == "TREND_UP":
+        if not indices.qqq_above_vwap:
+            return "NO TRADE", "QQQ below VWAP — tech not confirming upside"
+        if abs(qqq_pct) < 0.10 and confidence < 50:
+            return "NO TRADE", f"QQQ barely above VWAP ({qqq_pct:+.2f}%) with low confidence — wait for clear hold"
+        return "LONG", None
+
+    if market_state == "TREND_DOWN":
+        if indices.qqq_above_vwap:
+            return "NO TRADE", "QQQ still above VWAP — tech not confirming downside"
+        return "SHORT", None
+
+    return "NO TRADE", "Insufficient alignment"
+
+
+def _es_decision(
+    indices: "IndexRS", market_state: str, confidence: int
+) -> tuple[str, Optional[str]]:
+    if indices is None or not indices.data_ok or indices.spy_above_vwap is None:
+        return "NO TRADE", "SPY data unavailable"
+    if market_state in ("CHOP", "NO_DATA"):
+        return "NO TRADE", "CHOP — conflicting breadth, no broad edge"
+    if market_state == "ROTATIONAL":
+        return "NO TRADE", "Rotation — broad sectors are not aligned"
+
+    spy_pct = indices.spy_pct_vs_vwap or 0.0
+
+    if market_state == "TREND_UP":
+        if not indices.spy_above_vwap:
+            return "NO TRADE", "SPY below VWAP — broad market not confirming"
+        if abs(spy_pct) < 0.10 and confidence < 50:
+            return "NO TRADE", f"SPY near VWAP ({spy_pct:+.2f}%) with low confidence — wait for clear hold"
+        return "LONG", None
+
+    if market_state == "TREND_DOWN":
+        if indices.spy_above_vwap:
+            return "NO TRADE", "SPY still above VWAP — downside not confirmed"
+        return "SHORT", None
+
+    return "NO TRADE", "Insufficient alignment"
+
+
+def _rty_decision(
+    indices: "IndexRS", market_state: str
+) -> tuple[str, str]:
+    """
+    Stricter RTY logic.
+    LONG  requires IWM + SPY both above VWAP and small caps not lagging.
+    SHORT requires IWM + SPY both below VWAP.
+    NO TRADE when tech is carrying the tape or breadth is unclear.
+    """
+    if indices is None or not indices.data_ok:
+        return "NO TRADE", "IWM data unavailable"
+    if market_state in ("CHOP", "NO_DATA"):
+        return "NO TRADE", "CHOP — no broad participation edge"
+    if market_state == "ROTATIONAL":
+        return "NO TRADE", "Rotation — breadth is unclear, IWM confirmation needed"
+
+    iwm_up  = indices.iwm_above_vwap
+    spy_up  = indices.spy_above_vwap
+    qqq_pct = indices.qqq_pct_vs_vwap or 0.0
+    spy_pct = indices.spy_pct_vs_vwap or 0.0
+    iwm_pct = indices.iwm_pct_vs_vwap or 0.0
+
+    tech_vs_small = qqq_pct - iwm_pct   # positive = tech leading, small caps lagging
+    iwm_vs_spy    = spy_pct - iwm_pct    # positive = small caps lagging broad market
+
+    if market_state == "TREND_UP":
+        if iwm_up is not True:
+            return "NO TRADE", "IWM below VWAP — small caps not confirming upside"
+        if spy_up is not True:
+            return "NO TRADE", "SPY not above VWAP — broad market not confirmed for RTY"
+        if tech_vs_small > 0.60:
+            return "NO TRADE", (
+                f"Tech concentrated — QQQ {qqq_pct:+.2f}% vs VWAP, "
+                f"IWM only {iwm_pct:+.2f}% — small caps not participating"
+            )
+        if iwm_vs_spy > 0.50:
+            return "NO TRADE", (
+                f"Small caps lagging SPY by {iwm_vs_spy:.2f}% — breadth is not broad enough for RTY long"
+            )
+        return "LONG", ""
+
+    if market_state == "TREND_DOWN":
+        if iwm_up is not False:
+            return "NO TRADE", "IWM still above VWAP — small caps not confirming downside"
+        if spy_up is not False:
+            return "NO TRADE", "SPY still above VWAP — wait for broad market confirmation"
+        if iwm_pct < qqq_pct - 0.40:
+            # Small caps leading down harder than tech — strong breadth deterioration
+            pass  # this actually confirms RTY short
+        return "SHORT", ""
+
+    return "NO TRADE", "Insufficient confirmation"
+
+
+def _ym_decision(
+    indices: "IndexRS", market_state: str
+) -> tuple[str, str]:
+    """
+    Strict YM logic — does NOT automatically inherit ES direction.
+    YM requires broad non-tech participation, not just SPY being up.
+    YM defaults to NO TRADE when tech is driving the tape.
+    """
+    if indices is None or not indices.data_ok:
+        return "NO TRADE", "No market data for Dow proxy"
+    if market_state in ("CHOP", "NO_DATA"):
+        return "NO TRADE", "CHOP — no broad non-tech participation edge"
+    if market_state == "ROTATIONAL":
+        return "NO TRADE", "Rotation — no clear cyclical/value direction for Dow"
+
+    spy_up  = indices.spy_above_vwap
+    qqq_pct = indices.qqq_pct_vs_vwap or 0.0
+    spy_pct = indices.spy_pct_vs_vwap or 0.0
+
+    # Proxy for tech dominance: QQQ running significantly harder than SPY
+    tech_dominance = qqq_pct - spy_pct
+
+    if market_state == "TREND_UP":
+        if spy_up is not True:
+            return "NO TRADE", "SPY not above VWAP — Dow proxy not confirming"
+        if tech_dominance > 0.50:
+            return "NO TRADE", (
+                f"Tape driven by tech — QQQ {qqq_pct:+.2f}% vs SPY {spy_pct:+.2f}% vs VWAP. "
+                "No broad Dow/value participation confirmed"
+            )
+        return "LONG", ""
+
+    if market_state == "TREND_DOWN":
+        if spy_up is not False:
+            return "NO TRADE", "SPY still above VWAP — no clear Dow downside signal"
+        # If tech leads down much harder than broad market, Dow (value-heavy) may lag
+        if tech_dominance < -0.50:
+            return "NO TRADE", (
+                "Tech leading lower harder than broad tape — "
+                "Dow (value/cyclicals) may not follow at the same pace"
+            )
+        return "SHORT", ""
+
+    return "NO TRADE", "No clear Dow-style participation signal"
+
+
+# ── Rule-based confidence scoring ─────────────────────────────────────────────
+
+def _compute_structured_confidence(
+    flow_direction: str,
+    bull_pct: int,
+    bear_pct: int,
+    rs_data: Optional["MarketRS"],
+    all_entries: list,
+) -> int:
+    """
+    Rule-based confidence score.
+
+    Components:
+      +20  clear broad flow direction (≥70% one side)
+      +15  one side dominant (60–69%)
+      +8   slight lean (55–59%)
+      +20  SPY + QQQ VWAP both align with flow
+      +10  one index VWAP confirms flow
+      +15  IWM confirms (breadth)
+      +15  multiple flow-ticker RS readings confirm direction
+      +8   single ticker RS confirms
+      +10  no conflicting hedge flow
+      -10  multiple hedge entries conflict with direction
+      -10  mixed ticker RS (leaders and laggards in same session)
+      -10  broad index/sector internal conflict (QQQ vs SPY diverge > 0.8%)
+    Clamp: 0–100
+    """
+    score = 0
+    dominant_pct = max(bull_pct, bear_pct)
+
+    if dominant_pct >= 70:
+        score += 20
+    elif dominant_pct >= 60:
+        score += 15
+    elif dominant_pct >= 55:
+        score += 8
+
+    if rs_data and rs_data.indices.data_ok:
+        idx = rs_data.indices
+
+        if flow_direction == "BULLISH":
+            spy_ok = idx.spy_above_vwap is True
+            qqq_ok = idx.qqq_above_vwap is True
+        elif flow_direction == "BEARISH":
+            spy_ok = idx.spy_above_vwap is False
+            qqq_ok = idx.qqq_above_vwap is False
+        else:
+            spy_ok = qqq_ok = False
+
+        if spy_ok and qqq_ok:
+            score += 20
+        elif spy_ok or qqq_ok:
+            score += 10
+        elif idx.spy_above_vwap is not None and idx.qqq_above_vwap is not None:
+            score -= 10  # both indices explicitly conflict
+
+        # IWM breadth
+        if flow_direction == "BULLISH" and idx.iwm_above_vwap is True:
+            score += 15
+        elif flow_direction == "BEARISH" and idx.iwm_above_vwap is False:
+            score += 15
+        elif idx.iwm_above_vwap is not None:
+            score -= 10  # IWM explicitly conflicts
+
+        # Ticker RS confirmation
+        if rs_data.tickers:
+            if flow_direction == "BULLISH":
+                confirming  = sum(1 for t in rs_data.tickers.values() if t.classification == "STRONG")
+                conflicting = sum(1 for t in rs_data.tickers.values() if t.classification == "WEAK")
+            elif flow_direction == "BEARISH":
+                confirming  = sum(1 for t in rs_data.tickers.values() if t.classification == "WEAK")
+                conflicting = sum(1 for t in rs_data.tickers.values() if t.classification == "STRONG")
+            else:
+                confirming = conflicting = 0
+
+            if confirming >= 2:
+                score += 15
+            elif confirming == 1:
+                score += 8
+
+            if conflicting >= 2:
+                score -= 10  # key leaders explicitly disagree
+
+        # Hedge flow conflicts
+        hedge_count = sum(
+            1 for e in all_entries if getattr(e, "classification", "") == "HEDGE_DIRECTIONAL"
+        )
+        if hedge_count == 0:
+            score += 10
+        elif hedge_count >= 2:
+            score -= 10
+
+        # QQQ / SPY internal divergence — concentrated vs broad
+        spy_pct_val = idx.spy_pct_vs_vwap or 0.0
+        qqq_pct_val = idx.qqq_pct_vs_vwap or 0.0
+        if abs(qqq_pct_val - spy_pct_val) > 0.80:
+            score -= 10  # tech-concentrated tape conflicts with broad read
+
+    return max(0, min(100, score))
+
+
+# ── Execution plan ─────────────────────────────────────────────────────────────
+
+def _fmt_execution_plan(
+    market_state: str,
+    indices: "IndexRS",
+    direction: str = "NEUTRAL",
+    confidence: int = 0,
+) -> str:
     """
     Build EXECUTION PLAN block for NQ, ES, RTY, YM.
-    Returns "" if no usable index data.
+    Each instrument gets its own independent decision. Returns "" if no data.
     """
     if indices is None or not indices.data_ok:
         return ""
@@ -207,65 +470,95 @@ def _fmt_execution_plan(market_state: str, indices: "IndexRS") -> str:
     def _p(v: Optional[float]) -> str:
         return f"${v:.2f}" if v is not None else "N/A"
 
-    def _plan(future: str, ref: str, above: Optional[bool], vwap: Optional[float], pm_low: Optional[float]) -> list[str]:
-        vp = _p(vwap)
-        sp = _p(pm_low)
-        if above is None:
-            return [f"{future}: NO TRADE — {ref} data unavailable"]
-        if market_state == "TREND_UP" and above:
-            return [
-                f"{future}: LONG",
-                f"  Trigger: {ref} holds above {vp} VWAP",
-                f"  Stop: {ref} loses {sp} (PM low)",
-            ]
-        if market_state == "TREND_DOWN" and not above:
-            return [
-                f"{future}: SHORT",
-                f"  Trigger: {ref} fails to reclaim {vp} VWAP",
-                f"  Stop: {ref} reclaims {vp}",
-            ]
-        if market_state == "ROTATIONAL":
-            return [f"{future}: NO TRADE — rotation, no directional edge"]
-        if market_state == "CHOP":
-            return [f"{future}: NO TRADE — CHOP, wait for VWAP alignment"]
-        return [f"{future}: NO TRADE"]
+    def _render(future: str, action: str, reason: Optional[str],
+                trigger: str, stop: str) -> list[str]:
+        if action == "NO TRADE":
+            return [f"{future}: NO TRADE — {reason}"]
+        rows = [f"{future}: {action}", f"  Trigger: {trigger}", f"  Stop: {stop}"]
+        return rows
 
     lines = ["", "EXECUTION PLAN"]
-    lines += _plan("NQ",  "QQQ", indices.qqq_above_vwap, indices.qqq_vwap, indices.qqq_pm_low)
-    lines += _plan("ES",  "SPY", indices.spy_above_vwap, indices.spy_vwap, indices.spy_pm_low)
-    lines += _plan("RTY", "IWM", indices.iwm_above_vwap, indices.iwm_vwap, indices.iwm_pm_low)
 
-    # YM follows ES direction
-    if market_state == "TREND_UP" and indices.spy_above_vwap:
-        lines += [
-            "YM: LONG (follows ES)",
-            f"  Trigger: SPY VWAP reclaim confirms",
-            f"  Stop: SPY loses {_p(indices.spy_pm_low)}",
-        ]
-    elif market_state == "TREND_DOWN" and indices.spy_above_vwap is False:
-        lines += [
-            "YM: SHORT (follows ES)",
-            f"  Trigger: Bounce into {_p(indices.spy_vwap)} fails",
-            f"  Stop: SPY reclaims {_p(indices.spy_vwap)}",
-        ]
+    # NQ
+    nq_act, nq_why = _nq_decision(indices, market_state, confidence)
+    if nq_act == "LONG":
+        lines += _render("NQ", "LONG", None,
+                         f"QQQ holds above {_p(indices.qqq_vwap)} VWAP",
+                         f"QQQ loses {_p(indices.qqq_pm_low)} (PM low)")
+    elif nq_act == "SHORT":
+        lines += _render("NQ", "SHORT", None,
+                         f"QQQ fails to reclaim {_p(indices.qqq_vwap)} VWAP",
+                         f"QQQ reclaims {_p(indices.qqq_vwap)}")
     else:
-        lines.append("YM: NO TRADE — follows ES")
+        lines.append(f"NQ: NO TRADE — {nq_why}")
+
+    # ES
+    es_act, es_why = _es_decision(indices, market_state, confidence)
+    if es_act == "LONG":
+        lines += _render("ES", "LONG", None,
+                         f"SPY holds above {_p(indices.spy_vwap)} VWAP",
+                         f"SPY loses {_p(indices.spy_pm_low)} (PM low)")
+    elif es_act == "SHORT":
+        lines += _render("ES", "SHORT", None,
+                         f"SPY fails to reclaim {_p(indices.spy_vwap)} VWAP",
+                         f"SPY reclaims {_p(indices.spy_vwap)}")
+    else:
+        lines.append(f"ES: NO TRADE — {es_why}")
+
+    # RTY
+    rty_act, rty_why = _rty_decision(indices, market_state)
+    if rty_act == "LONG":
+        lines += _render("RTY", "LONG", None,
+                         f"IWM holds above {_p(indices.iwm_vwap)} VWAP with SPY breadth confirming",
+                         f"IWM loses {_p(indices.iwm_pm_low)} (PM low)")
+    elif rty_act == "SHORT":
+        lines += _render("RTY", "SHORT", None,
+                         f"IWM fails to reclaim {_p(indices.iwm_vwap)} VWAP",
+                         f"IWM reclaims {_p(indices.iwm_vwap)}")
+    else:
+        lines.append(f"RTY: NO TRADE — {rty_why}")
+
+    # YM
+    ym_act, ym_why = _ym_decision(indices, market_state)
+    if ym_act == "LONG":
+        lines += _render("YM", "LONG", None,
+                         f"SPY VWAP hold confirms broad non-tech participation",
+                         f"SPY loses {_p(indices.spy_pm_low)}")
+    elif ym_act == "SHORT":
+        lines += _render("YM", "SHORT", None,
+                         f"SPY fails {_p(indices.spy_vwap)} with broad cyclical weakness",
+                         f"SPY reclaims {_p(indices.spy_vwap)}")
+    else:
+        lines.append(f"YM: NO TRADE — {ym_why}")
 
     return "\n".join(lines)
 
 
+# ── Final Verdict ─────────────────────────────────────────────────────────────
+
 def _fmt_final_verdict(
     market_state: str,
     direction: str,
-    confidence: int,
+    flow_confidence: int,
     rs_data: Optional["MarketRS"],
+    bull_pct: int,
+    bear_pct: int,
     entries_all: list,
     entries_bull: list,
     entries_bear: list,
 ) -> str:
     """
     Build FINAL VERDICT block. Always the last section.
+    Confidence is re-computed from rule-based scoring when rs_data is available.
     """
+    # Structured confidence replaces the raw flow confidence when RS data is available
+    if rs_data and rs_data.data_ok:
+        confidence = _compute_structured_confidence(
+            direction, bull_pct, bear_pct, rs_data, entries_all
+        )
+    else:
+        confidence = flow_confidence
+
     state_label = {
         "TREND_UP":   "TREND UP",
         "TREND_DOWN": "TREND DOWN",
@@ -274,83 +567,170 @@ def _fmt_final_verdict(
         "NO_DATA":    "UNKNOWN",
     }.get(market_state, market_state)
 
+    # Confidence band label
+    if confidence <= 20:
+        band = "unusable / highly mixed"
+    elif confidence <= 40:
+        band = "weak edge"
+    elif confidence <= 60:
+        band = "tradable but not clean"
+    elif confidence <= 80:
+        band = "strong directional read"
+    else:
+        band = "high alignment"
+
     lines = ["", "FINAL VERDICT"]
-    lines.append(f"Market State: {state_label} | Confidence: {confidence}/100")
+    lines.append(f"Market State: {state_label} | Confidence: {confidence}/100 ({band})")
 
-    # WHY line
-    why_parts: list[str] = []
-    if direction != "NEUTRAL" and entries_all:
-        bull_n = sum(1 for e in entries_all if getattr(e, "side", "") == "CALL")
-        bear_n = len(entries_all) - bull_n
-        pct    = round(bull_n / len(entries_all) * 100) if direction == "BULLISH" else round(bear_n / len(entries_all) * 100)
-        why_parts.append(f"{direction} flow ({pct}%)")
+    # ── WHY (structured bullet list) ──────────────────────────────────────────
+    lines.append("WHY:")
 
+    # Flow direction
+    if direction == "NEUTRAL":
+        lines.append(f"- Flow is split — no dominant directional bias")
+    else:
+        dom_pct = bull_pct if direction == "BULLISH" else bear_pct
+        lines.append(f"- {direction} index flow is dominant ({dom_pct}%)")
+
+    # SPY / QQQ / IWM VWAP state
     if rs_data and rs_data.indices.data_ok:
         idx = rs_data.indices
-        vwap_notes = []
-        if idx.spy_above_vwap is True:
-            vwap_notes.append("SPY above VWAP")
-        elif idx.spy_above_vwap is False:
-            vwap_notes.append("SPY below VWAP")
-        if idx.qqq_above_vwap is True:
-            vwap_notes.append("QQQ above VWAP")
-        elif idx.qqq_above_vwap is False:
-            vwap_notes.append("QQQ below VWAP")
-        if vwap_notes:
-            why_parts.append(", ".join(vwap_notes))
 
-    leaders  = list(dict.fromkeys(getattr(e, "ticker", "") for e in entries_bull[:2] if getattr(e, "ticker", "")))
-    laggards = list(dict.fromkeys(getattr(e, "ticker", "") for e in entries_bear[:2] if getattr(e, "ticker", "")))
+        def _vwap_state(name: str, above: Optional[bool], pct: Optional[float]) -> str:
+            if above is None:
+                return f"{name}: no data"
+            pos  = "above" if above else "below"
+            pstr = f" ({pct:+.2f}%)" if pct is not None else ""
+            return f"{name} is {pos} VWAP{pstr}"
+
+        lines.append(f"- {_vwap_state('SPY', idx.spy_above_vwap, idx.spy_pct_vs_vwap)}")
+        lines.append(f"- {_vwap_state('QQQ', idx.qqq_above_vwap, idx.qqq_pct_vs_vwap)}")
+        lines.append(f"- {_vwap_state('IWM', idx.iwm_above_vwap, idx.iwm_pct_vs_vwap)}")
+
+        # Breadth / concentration commentary
+        spy_pct_val = idx.spy_pct_vs_vwap or 0.0
+        qqq_pct_val = idx.qqq_pct_vs_vwap or 0.0
+        iwm_pct_val = idx.iwm_pct_vs_vwap or 0.0
+        tech_vs_broad = qqq_pct_val - spy_pct_val
+        tech_vs_small = qqq_pct_val - iwm_pct_val
+
+        if tech_vs_small > 0.60:
+            lines.append(
+                f"- Tape is concentrated — tech outpacing small caps by {tech_vs_small:.2f}%"
+            )
+        elif tech_vs_broad > 0.50:
+            lines.append(
+                f"- Move tilted toward tech — QQQ leading SPY by {tech_vs_broad:.2f}%"
+            )
+        elif abs(tech_vs_small) < 0.20 and abs(tech_vs_broad) < 0.20:
+            lines.append("- Broad participation — tech, large-cap, and small caps moving together")
+        else:
+            lines.append("- Mixed participation across indices")
+
+    # Leaders / Laggards
+    leaders  = list(dict.fromkeys(
+        getattr(e, "ticker", "") for e in entries_bull[:3] if getattr(e, "ticker", "")
+    ))
+    laggards = list(dict.fromkeys(
+        getattr(e, "ticker", "") for e in entries_bear[:3] if getattr(e, "ticker", "")
+    ))
     if leaders:
-        why_parts.append(f"Leaders: {', '.join(leaders)}")
+        lines.append(f"- Leading: {', '.join(leaders)}")
     if laggards:
-        why_parts.append(f"Laggards: {', '.join(laggards)}")
+        lines.append(f"- Lagging: {', '.join(laggards)}")
 
-    if why_parts:
-        lines.append("WHY: " + ". ".join(why_parts) + ".")
-
-    # Compact per-futures lines
+    # ── Compact futures summary ───────────────────────────────────────────────
     if rs_data and rs_data.indices.data_ok:
         idx = rs_data.indices
 
-        def _vp(v):
+        def _vp(v: Optional[float]) -> str:
             return f"${v:.2f}" if v is not None else "?"
 
-        def _compact(future: str, ref: str, above: Optional[bool], vwap: Optional[float]) -> str:
-            if above is None:
-                return f"{future} → NO DATA"
-            if market_state == "TREND_UP" and above:
+        nq_act,  _ = _nq_decision(idx, market_state, confidence)
+        es_act,  _ = _es_decision(idx, market_state, confidence)
+        rty_act, _ = _rty_decision(idx, market_state)
+        ym_act,  _ = _ym_decision(idx, market_state)
+
+        def _compact_line(future: str, action: str, ref: str, vwap: Optional[float]) -> str:
+            if action == "LONG":
                 return f"{future} → LONG | {ref} above {_vp(vwap)}"
-            if market_state == "TREND_DOWN" and not above:
+            if action == "SHORT":
                 return f"{future} → SHORT | {ref} below {_vp(vwap)}"
             return f"{future} → NO TRADE"
 
-        lines.append(_compact("NQ",  "QQQ", idx.qqq_above_vwap, idx.qqq_vwap))
-        lines.append(_compact("ES",  "SPY", idx.spy_above_vwap, idx.spy_vwap))
-        lines.append(_compact("RTY", "IWM", idx.iwm_above_vwap, idx.iwm_vwap))
-        ym = _compact("ES",  "SPY", idx.spy_above_vwap, idx.spy_vwap)
-        lines.append(ym.replace("ES →", "YM →") + " (follows ES)")
+        lines.append(_compact_line("NQ",  nq_act,  "QQQ", idx.qqq_vwap))
+        lines.append(_compact_line("ES",  es_act,  "SPY", idx.spy_vwap))
+        lines.append(_compact_line("RTY", rty_act, "IWM", idx.iwm_vwap))
+        lines.append(_compact_line("YM",  ym_act,  "SPY", idx.spy_vwap))
 
-    # DO NOT
+    # ── DO NOT ────────────────────────────────────────────────────────────────
     if market_state == "TREND_UP":
-        do_not = "Short into VWAP strength. Chase breakouts without pullback."
+        do_not = "Short into VWAP strength. Chase breakouts without a pullback entry."
     elif market_state == "TREND_DOWN":
-        do_not = "Buy weakness without VWAP reclaim. Catch falling knives."
+        do_not = "Buy weakness without a VWAP reclaim. Catch falling knives."
     elif market_state == "ROTATIONAL":
-        do_not = "Take outright directional futures positions. Use pairs only."
+        do_not = "Take outright directional futures positions. Use sector pairs only."
     else:
-        do_not = "Force trades. No edge in CHOP — wait for VWAP alignment."
+        do_not = "Force trades. No edge in CHOP — wait for VWAP alignment across SPY, QQQ, and IWM."
     lines.append(f"DO NOT: {do_not}")
 
-    # KEY READ
-    if market_state == "TREND_UP":
-        key_read = "Growth and tech leading — bias long NQ until QQQ loses VWAP."
-    elif market_state == "TREND_DOWN":
-        key_read = "Selling pressure dominant — fade bounces, protect gains."
-    elif market_state == "ROTATIONAL":
-        key_read = "Sector rotation active — target relative strength, avoid index plays."
+    # ── KEY READ ──────────────────────────────────────────────────────────────
+    if rs_data and rs_data.indices.data_ok:
+        idx = rs_data.indices
+        spy_pct_val = idx.spy_pct_vs_vwap or 0.0
+        qqq_pct_val = idx.qqq_pct_vs_vwap or 0.0
+        iwm_pct_val = idx.iwm_pct_vs_vwap or 0.0
+        tech_vs_small = qqq_pct_val - iwm_pct_val
+
+        if market_state == "TREND_UP":
+            if tech_vs_small > 0.60:
+                key_read = (
+                    "Tech may bounce, but broad participation is weak — "
+                    "favor NQ longs on VWAP hold, avoid forcing RTY or YM."
+                )
+            elif laggards:
+                key_read = (
+                    f"Bias long NQ and ES while QQQ and SPY hold VWAP. "
+                    f"Watch {laggards[0]} for rotation or reversal signal."
+                )
+            else:
+                key_read = (
+                    "Broad market aligned — bias long NQ and ES. "
+                    "RTY and YM add if IWM and non-tech breadth hold."
+                )
+        elif market_state == "TREND_DOWN":
+            if tech_vs_small < -0.30:
+                key_read = (
+                    "Tech leading lower — NQ short is the primary trade. "
+                    "Confirm RTY and YM independently before adding."
+                )
+            else:
+                key_read = (
+                    "Broad selling pressure is active — fade bounces on NQ and ES. "
+                    "RTY short adds only if IWM confirms VWAP rejection."
+                )
+        elif market_state == "ROTATIONAL":
+            key_read = (
+                "Sector rotation active — avoid index futures, "
+                f"target relative strength plays. "
+                + (f"Leaders: {', '.join(leaders)}. " if leaders else "")
+                + (f"Fading: {', '.join(laggards)}." if laggards else "")
+            )
+        else:
+            key_read = (
+                "No clear edge — reduce size. "
+                "Wait for SPY, QQQ, and IWM to align above or below VWAP before committing."
+            )
     else:
-        key_read = "No clear edge — reduce size, wait for index VWAP alignment."
+        if market_state == "TREND_UP":
+            key_read = "Bias long NQ until QQQ loses VWAP. Confirm breadth with IWM before adding RTY/YM."
+        elif market_state == "TREND_DOWN":
+            key_read = "Selling pressure dominant — fade bounces, protect gains."
+        elif market_state == "ROTATIONAL":
+            key_read = "Sector rotation active — target relative strength, avoid index plays."
+        else:
+            key_read = "No clear edge — reduce size, wait for index VWAP alignment."
+
     lines.append(f"KEY READ: {key_read}")
 
     return "\n".join(lines)
@@ -513,15 +893,21 @@ def format_channel_b_report(analysis: dict, rs_data: Optional["MarketRS"] = None
 
     # ── Execution Plan (RS-powered) ───────────────────────────────────────────
     if rs_data and rs_data.data_ok:
-        exec_plan = _fmt_execution_plan(rs_data.market_state, rs_data.indices)
+        exec_plan = _fmt_execution_plan(
+            rs_data.market_state, rs_data.indices,
+            direction=effective_direction, confidence=confidence,
+        )
         if exec_plan:
             lines.append(exec_plan)
 
     # ── Final Verdict ─────────────────────────────────────────────────────────
-    ms = rs_data.market_state if (rs_data and rs_data.data_ok) else "NO_DATA"
+    ms         = rs_data.market_state if (rs_data and rs_data.data_ok) else "NO_DATA"
     bulls_list = sorted([e for e in actionable if e.side == "CALL"], key=lambda e: e.priority)
     bears_list = sorted([e for e in actionable if e.side == "PUT"],  key=lambda e: e.priority)
-    lines.append(_fmt_final_verdict(ms, effective_direction, confidence, rs_data, actionable, bulls_list, bears_list))
+    lines.append(_fmt_final_verdict(
+        ms, effective_direction, confidence, rs_data,
+        bull_pct, bear_pct, actionable, bulls_list, bears_list,
+    ))
 
     return "\n".join(lines)
 
@@ -829,7 +1215,10 @@ def format_aggregated_report_b(report, rs_data: Optional["MarketRS"] = None) -> 
 
     # ── Execution Plan (RS-powered) ───────────────────────────────────────────
     if rs_data and rs_data.data_ok:
-        exec_plan = _fmt_execution_plan(rs_data.market_state, rs_data.indices)
+        exec_plan = _fmt_execution_plan(
+            rs_data.market_state, rs_data.indices,
+            direction=effective_direction, confidence=report.confidence,
+        )
         if exec_plan:
             lines.append(exec_plan)
 
@@ -840,6 +1229,8 @@ def format_aggregated_report_b(report, rs_data: Optional["MarketRS"] = None) -> 
         effective_direction,
         report.confidence,
         rs_data,
+        report.bull_pct,
+        report.bear_pct,
         all_entries,
         report.top_bulls,
         report.top_bears,
