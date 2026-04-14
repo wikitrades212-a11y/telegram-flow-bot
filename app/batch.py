@@ -29,6 +29,13 @@ class BatchEntry:
     signal_role: str
     priority: int
     decision: str   # "HOLD" | "GO" | "KILL" | "ERROR"
+    # Extra fields for Channel B formatted report
+    strike: float = 0.0
+    iv_pct: float = 0.0
+    vol_oi_ratio: float = 0.0
+    delta: float = 0.0
+    dte: int = 0
+    direction: str = "NEUTRAL"
 
 
 class BatchStore:
@@ -54,6 +61,12 @@ class BatchStore:
             signal_role=signal_role,
             priority=priority,
             decision=decision,
+            strike=getattr(sig, "strike", 0.0),
+            iv_pct=getattr(sig, "iv_pct", 0.0),
+            vol_oi_ratio=getattr(sig, "vol_oi_ratio", 0.0),
+            delta=getattr(sig, "delta", 0.0) or 0.0,
+            dte=getattr(sig, "dte", 0),
+            direction=getattr(sig, "direction", "NEUTRAL"),
         ))
         logger.debug(
             "Batch add | %s | cls=%s | role=%s | p%d | decision=%s | size=%d",

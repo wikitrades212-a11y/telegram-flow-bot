@@ -22,13 +22,6 @@ logger = logging.getLogger(__name__)
 
 
 async def restore_db(bot: Bot, backup_chat_id: str, db_path: str) -> bool:
-    """
-    Download the pinned backup document from backup_chat_id into db_path.
-
-    Returns True if a backup was restored, False if no backup exists or
-    the local DB is already present (in which case the local copy is kept).
-    Errors are logged but never raised — startup continues regardless.
-    """
     if not backup_chat_id:
         return False
 
@@ -66,12 +59,6 @@ async def restore_db(bot: Bot, backup_chat_id: str, db_path: str) -> bool:
 
 
 async def backup_db(bot: Bot, backup_chat_id: str, db_path: str) -> bool:
-    """
-    Upload db_path as a document to backup_chat_id and pin it.
-
-    The previous pinned message is unpinned first to keep the chat tidy.
-    Returns True on success, False on any failure (non-fatal).
-    """
     if not backup_chat_id:
         return False
 
@@ -81,7 +68,6 @@ async def backup_db(bot: Bot, backup_chat_id: str, db_path: str) -> bool:
         return False
 
     try:
-        # Unpin previous backup (best-effort)
         try:
             chat = await bot.get_chat(backup_chat_id)
             if chat.pinned_message:
@@ -90,14 +76,14 @@ async def backup_db(bot: Bot, backup_chat_id: str, db_path: str) -> bool:
                     message_id=chat.pinned_message.message_id,
                 )
         except TelegramError:
-            pass  # not critical if unpin fails
+            pass
 
         with open(local, "rb") as fh:
             sent = await bot.send_document(
                 chat_id=backup_chat_id,
                 document=fh,
                 filename=local.name,
-                caption=f"signals.db backup",
+                caption="signals.db backup",
             )
 
         await bot.pin_chat_message(
@@ -126,10 +112,6 @@ async def backup_loop(
     db_path: str,
     interval_seconds: int = 300,
 ) -> None:
-    """
-    Periodically call backup_db. Runs until cancelled.
-    Errors are swallowed so the loop never kills the bot.
-    """
     if not backup_chat_id:
         logger.info("[backup] BACKUP_CHAT_ID not set — periodic backup disabled")
         return
