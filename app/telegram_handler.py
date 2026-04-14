@@ -37,6 +37,143 @@ def _fmt_p(usd: float) -> str:
     return f"${usd:.0f}"
 
 
+_MARKET_TICKERS = {"SPY", "QQQ", "IWM", "SPX", "NDX", "DIA"}
+
+
+def _contract_score(e, direction: str) -> float:
+    """
+    Composite score for actionability. Higher = more tradeable.
+    Criteria: premium, vol/oi, ATM-ness (delta 0.4-0.6), DTE 3-10, bias alignment.
+    """
+    delta_abs = abs(getattr(e, "delta", 0) or 0)
+    vol_oi    = getattr(e, "vol_oi_ratio", 0) or 0
+    premium   = getattr(e, "premium_usd", 0) or 0
+    dte       = getattr(e, "dte", 0) or 0
+    side      = getattr(e, "side", "")
+
+    score = 0.0
+
+    # Premium (log scale so $22M doesn't totally dominate)
+    import math
+    if premium > 0:
+        score += min(40, math.log10(max(1, premium)) * 6)
+
+    # Vol/OI — aggressive flow signal
+    score += min(20, vol_oi * 2)
+
+    # ATM-ness — prefer delta 0.40–0.60
+    if 0.40 <= delta_abs <= 0.60:
+        score += 20
+    elif 0.30 <= delta_abs < 0.40 or 0.60 < delta_abs <= 0.70:
+        score += 8
+
+    # DTE — prefer 3–10
+    if 3 <= dte <= 10:
+        score += 15
+    elif 1 <= dte < 3:
+        score += 5
+    elif 11 <= dte <= 21:
+        score += 8
+
+    # Bias alignment
+    aligned = (direction == "BULLISH" and side == "CALL") or \
+              (direction == "BEARISH" and side == "PUT")
+    contra  = (direction == "BULLISH" and side == "PUT") or \
+              (direction == "BEARISH" and side == "CALL")
+    if aligned:
+        score += 15
+    elif contra and delta_abs >= 0.35:
+        score += 5   # meaningful hedge — keep but score lower
+
+    return score
+
+
+def _contract_description(e, direction: str) -> str:
+    """Short plain-English description of why this contract is notable."""
+    delta_abs = abs(getattr(e, "delta", 0) or 0)
+    vol_oi    = getattr(e, "vol_oi_ratio", 0) or 0
+    premium   = getattr(e, "premium_usd", 0) or 0
+    side      = getattr(e, "side", "")
+    ticker    = getattr(e, "ticker", "")
+
+    parts = []
+
+    if ticker in _MARKET_TICKERS:
+        parts.append("index play")
+    if premium >= 10_000_000:
+        parts.append("institutional size")
+    elif premium >= 1_000_000:
+        parts.append("large premium")
+    if vol_oi >= 10:
+        parts.append("extreme vol/oi")
+    elif vol_oi >= 5:
+        parts.append("high vol/oi")
+
+    aligned = (direction == "BULLISH" and side == "CALL") or \
+              (direction == "BEARISH" and side == "PUT")
+    if not aligned and delta_abs >= 0.35:
+        parts.append("hedge")
+    elif 0.40 <= delta_abs <= 0.60:
+        parts.append("conviction delta")
+
+    return ", ".join(parts) if parts else "strong flow"
+
+
+def _top_actionable_contracts(entries, direction: str, top_n: int = 5) -> list:
+    """
+    Return top_n contracts ranked by actionability score.
+    Filters to bias-aligned + meaningful hedges only.
+    Deduplicates by (ticker, strike, side).
+    """
+    seen: set[tuple] = set()
+    candidates = []
+
+    for e in entries:
+        key = (getattr(e, "ticker", ""), getattr(e, "strike", 0), getattr(e, "side", ""))
+        if key in seen:
+            continue
+        seen.add(key)
+
+        # Exclude contracts outside tradeable DTE range
+        dte = getattr(e, "dte", 0) or 0
+        if dte < 1 or dte > 21:
+            continue
+
+        # Exclude pure lottery / noise
+        classification = getattr(e, "classification", "")
+        if classification == "LOTTERY":
+            continue
+
+        score = _contract_score(e, direction)
+        if score > 0:
+            candidates.append((score, e))
+
+    candidates.sort(key=lambda x: x[0], reverse=True)
+    return [e for _, e in candidates[:top_n]]
+
+
+def _fmt_actionable_section(entries, direction: str) -> str:
+    """Build the TOP ACTIONABLE CONTRACTS section string."""
+    contracts = _top_actionable_contracts(entries, direction)
+    if not contracts:
+        return ""
+
+    lines = ["", "TOP ACTIONABLE CONTRACTS"]
+    for e in contracts:
+        delta_abs = abs(getattr(e, "delta", 0) or 0)
+        delta_str = f"{getattr(e, 'delta', 0):+.2f}" if getattr(e, "delta", None) is not None else "N/A"
+        dte       = getattr(e, "dte", 0)
+        ticker    = getattr(e, "ticker", "")
+        strike    = getattr(e, "strike", 0)
+        side      = getattr(e, "side", "")
+        desc      = _contract_description(e, direction)
+        lines.append(
+            f"• {ticker} {strike:.0f}{side[0]} "
+            f"(Δ {delta_str}, DTE {dte}) — {desc}"
+        )
+    return "\n".join(lines)
+
+
 def _tag_for(entry) -> str:
     """Derive a short label tag from classification and direction."""
     cls = entry.classification
@@ -194,6 +331,11 @@ def format_channel_b_report(analysis: dict) -> str:
     lines.append(f"▸ Primary: {primary}")
     lines.append(f"▸ Secondary: {secondary}")
     lines.append(f"▸ Execution: {execution}")
+
+    # ── Top Actionable Contracts ──────────────────────────────────────────────
+    actionable_section = _fmt_actionable_section(entries, direction)
+    if actionable_section:
+        lines.append(actionable_section)
 
     return "\n".join(lines)
 
@@ -481,6 +623,13 @@ def format_aggregated_report_b(report) -> str:
         lines.append("Quick Read")
         for bullet in report.quick_read[:4]:   # cap at 4 lines
             lines.append(f"• {bullet.strip().lstrip('•· ')}")
+        lines.append("")
+
+    # Top Actionable Contracts — combine all flow entries
+    all_entries = report.top_overall or (report.top_bulls + report.top_bears)
+    actionable_section = _fmt_actionable_section(all_entries, report.direction)
+    if actionable_section:
+        lines.append(actionable_section)
 
     return "\n".join(lines)
 
