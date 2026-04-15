@@ -38,9 +38,10 @@ class BatchEntry:
     strike: float = 0.0
     iv_pct: float = 0.0
     vol_oi_ratio: float = 0.0
-    delta: Optional[float] = None   # None = not reported (not zero delta)
+    delta: Optional[float] = None         # None = not reported (not zero delta)
     dte: int = 0
     direction: str = "NEUTRAL"
+    option_price: Optional[float] = None  # per-contract mid/last at time of callout
 
 
 class BatchStore:
@@ -69,9 +70,13 @@ class BatchStore:
             strike=getattr(sig, "strike", 0.0),
             iv_pct=getattr(sig, "iv_pct", 0.0),
             vol_oi_ratio=getattr(sig, "vol_oi_ratio", 0.0),
-            delta=getattr(sig, "delta", None),   # preserve None — do not coerce to 0.0
+            delta=getattr(sig, "delta", None),        # preserve None — do not coerce to 0.0
             dte=getattr(sig, "dte", 0),
             direction=getattr(sig, "direction", "NEUTRAL"),
+            option_price=(
+                getattr(sig, "option_mid", None)
+                or getattr(sig, "option_last", None)
+            ),
         ))
         logger.debug(
             "Batch add | %s | cls=%s | role=%s | p%d | decision=%s | size=%d",

@@ -2113,21 +2113,23 @@ def format_hot_options(
     lines = [label, ""]
 
     for i, (_, e) in enumerate(top, 1):
-        ticker  = getattr(e, "ticker", "?")
-        strike  = getattr(e, "strike", 0)
-        side    = getattr(e, "side", "?")
-        premium = getattr(e, "premium_usd", 0)
-        vol_oi  = getattr(e, "vol_oi_ratio", 0)
-        delta_v = getattr(e, "delta", None)
-        dte     = getattr(e, "dte", 0)
+        ticker    = getattr(e, "ticker", "?")
+        strike    = getattr(e, "strike", 0)
+        side      = getattr(e, "side", "?")
+        premium   = getattr(e, "premium_usd", 0)
+        vol_oi    = getattr(e, "vol_oi_ratio", 0)
+        delta_v   = getattr(e, "delta", None)
+        dte       = getattr(e, "dte", 0)
+        opt_price = getattr(e, "option_price", None)
 
-        strike_str = f" {strike:.0f}" if strike else ""
-        delta_str  = f"{delta_v:+.2f}" if delta_v is not None else "N/A"
-        bias       = "BULLISH" if side == "CALL" else "BEARISH"
-        tag        = _action_tag(e, direction)
+        strike_str    = f" {strike:.0f}" if strike else ""
+        delta_str     = f"{delta_v:+.2f}" if delta_v is not None else "N/A"
+        opt_price_str = f" @${opt_price:.2f}" if opt_price else ""
+        bias          = "BULLISH" if side == "CALL" else "BEARISH"
+        tag           = _action_tag(e, direction)
 
         lines.append(
-            f"{i}. {ticker}{strike_str} {side} | "
+            f"{i}. {ticker}{strike_str} {side}{opt_price_str} | "
             f"{_fmt_p(premium)} | "
             f"Vol/OI {vol_oi:.1f}x | "
             f"\u0394 {delta_str} | "
