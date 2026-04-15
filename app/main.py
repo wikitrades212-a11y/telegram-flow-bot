@@ -62,7 +62,7 @@ from app.rs_engine import compute_rs
 from app.scheduler import Scheduler, SignalWindow, _slot_key
 from app.classifier import classify_flow
 from app.intel_formatter import format_intel
-from app.batch import BatchStore, _analyze
+from app.batch import BatchStore, BatchEntry, _analyze
 from app.storage import (
     init_db, was_sent, mark_sent,
     record_signal, update_signal_go, update_price_check,
@@ -70,6 +70,94 @@ from app.storage import (
 )
 from app.backup import restore_db, backup_db, backup_loop
 from app.tradier import fetch_option_quote
+
+
+# ── Aggregated report → BatchEntry converter ─────────────────────────────────
+
+def _intel_entries_to_batch(report) -> list[BatchEntry]:
+    """
+    Convert FlowEntry objects from a parsed IntelReport into BatchEntry objects
+    so they can be added to sig_window and scored by /options commands.
+
+    FlowEntry lacks score, classification, signal_role, and priority — we derive
+    reasonable values from what's available (ticker, side, tag, premium, delta, dte).
+    """
+    from app.classifier import MARKET_TICKERS, SECTOR_TICKERS
+
+    _TAG_TO_CLS = {
+        "HEDGE":       "HEDGE_DIRECTIONAL",
+        "POSITIONAL":  None,          # resolved per side below
+        "SPEC":        "SPECULATIVE_DIRECTIONAL",
+        "SPECULATIVE": "SPECULATIVE_DIRECTIONAL",
+        "CONTINUATION":"CONTINUATION_STRONG",
+        "SWEEP":       "SPECULATIVE_DIRECTIONAL",
+    }
+
+    result: list[BatchEntry] = []
+    seen: set[str] = set()
+
+    # Prefer top_overall; fall back to bulls + bears (avoid double-counting)
+    all_entries = report.top_overall or (report.top_bulls + report.top_bears)
+
+    for e in all_entries:
+        uid = f"{e.ticker}_{e.side}_{e.strike}_{e.dte}"
+        if uid in seen:
+            continue
+        seen.add(uid)
+
+        # Signal role
+        if e.ticker in MARKET_TICKERS:
+            role = "MARKET_SIGNAL"
+        elif e.ticker in SECTOR_TICKERS:
+            role = "SECTOR_SIGNAL"
+        else:
+            role = "SPECULATIVE_PLAY"
+
+        # Classification from tag
+        tag_upper = (e.tag or "").upper().strip()
+        cls = _TAG_TO_CLS.get(tag_upper)
+        if cls is None:
+            if tag_upper == "POSITIONAL":
+                cls = "POSITIONAL_BULL" if e.side == "CALL" else "POSITIONAL_BEAR"
+            elif role == "MARKET_SIGNAL":
+                cls = "HEDGE_DIRECTIONAL" if e.side == "PUT" else "POSITIONAL_BULL"
+            else:
+                cls = "SPECULATIVE_DIRECTIONAL"
+
+        # Priority
+        if cls in ("HEDGE_DIRECTIONAL", "POSITIONAL_BULL", "POSITIONAL_BEAR"):
+            pri = 1
+        elif cls == "SPECULATIVE_DIRECTIONAL":
+            pri = 2
+        else:
+            pri = 3
+
+        # Downgrade SPECULATIVE_PLAY to NOISE at priority 5
+        if pri >= 5 and role == "SPECULATIVE_PLAY":
+            role = "NOISE"
+
+        direction = "BULLISH" if e.side == "CALL" else "BEARISH"
+        delta_val = e.delta if (e.delta and e.delta != 0.0) else None
+
+        result.append(BatchEntry(
+            signal_id=uid,
+            ticker=e.ticker,
+            side=e.side,
+            premium_usd=e.premium_usd,
+            score=80,            # aggregated entries already passed upstream filters
+            classification=cls,
+            signal_role=role,
+            priority=pri,
+            decision="HOLD",
+            strike=e.strike,
+            iv_pct=e.iv_pct,
+            vol_oi_ratio=e.vol_oi_ratio,
+            delta=delta_val,
+            dte=e.dte,
+            direction=direction,
+        ))
+
+    return result
 
 
 # ── Logging ───────────────────────────────────────────────────────────────────
@@ -957,6 +1045,18 @@ async def main() -> None:
                 fallback = "\n".join(l.strip() for l in text.splitlines() if l.strip())
                 await post_to_b(fallback, label="AGGREGATED_RAW_FALLBACK")
                 return
+
+            # ── Feed aggregated flow entries into sig_window ──────────────────
+            # PATH A never added entries to sig_window, so /options always saw
+            # an empty window. Fix: convert FlowEntry → BatchEntry and add them.
+            _agg_entries = _intel_entries_to_batch(report)
+            for _be in _agg_entries:
+                sig_window.add(_be)
+            if _agg_entries:
+                logger.info(
+                    "sig_window: added %d entries from aggregated report | msg_id=%s",
+                    len(_agg_entries), message.message_id,
+                )
 
             # Fetch RS data in parallel with any remaining work
             flow_tickers = list(dict.fromkeys(
