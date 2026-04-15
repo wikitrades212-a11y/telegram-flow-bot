@@ -830,6 +830,7 @@ async def main() -> None:
             now_et    = _now_et()
             session   = current_session(now_et)
             entries   = sig_window.fresh()
+            logger.info("/debug invoked | session=%s | window_size=%d", session, len(entries))
             ana       = _analyze(entries) if entries else {}
             direction = ana.get("direction", "NEUTRAL")
 
