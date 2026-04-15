@@ -923,7 +923,7 @@ async def main() -> None:
         "Manual command handlers registered: "
         "/options /bulls /bears /tech /techbulls /techbears /hedges "
         "/report /premarket /flow /bias "
-        "/nq /es /rty /ym /last | allowed_users=%s",
+        "/nq /es /rty /ym /last /debug | allowed_users=%s",
         config.ALLOWED_USERS or "all",
     )
 
