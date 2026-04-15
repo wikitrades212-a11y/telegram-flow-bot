@@ -20,6 +20,8 @@ from typing import TYPE_CHECKING, Optional
 
 from app.parser import FlowSignal
 from app.decision_engine import Decision
+from app.session import current_session, baseline_data_quality, degrade_data_quality
+from app.bot_data import build_bot_data, render_bot_data
 
 if TYPE_CHECKING:
     from app.rs_engine import MarketRS, IndexRS
@@ -69,11 +71,12 @@ def _contract_score(e, direction: str) -> float:
     Composite score for actionability. Higher = more tradeable.
     Criteria: premium, vol/oi, ATM-ness (delta 0.4-0.6), DTE 3-10, bias alignment.
     """
-    delta_abs = abs(getattr(e, "delta", 0) or 0)
-    vol_oi    = getattr(e, "vol_oi_ratio", 0) or 0
-    premium   = getattr(e, "premium_usd", 0) or 0
-    dte       = getattr(e, "dte", 0) or 0
-    side      = getattr(e, "side", "")
+    _raw_delta = getattr(e, "delta", None)
+    delta_abs  = abs(_raw_delta) if _raw_delta is not None else 0.0
+    vol_oi     = getattr(e, "vol_oi_ratio", 0) or 0
+    premium    = getattr(e, "premium_usd", 0) or 0
+    dte        = getattr(e, "dte", 0) or 0
+    side       = getattr(e, "side", "")
 
     score = 0.0
 
@@ -85,8 +88,10 @@ def _contract_score(e, direction: str) -> float:
     # Vol/OI — aggressive flow signal
     score += min(20, vol_oi * 2)
 
-    # ATM-ness — prefer delta 0.40–0.60
-    if 0.40 <= delta_abs <= 0.60:
+    # ATM-ness — prefer delta 0.40–0.60; None delta gets a neutral partial credit
+    if _raw_delta is None:
+        score += 8   # reported flow without delta — assume tradeable, no bonus
+    elif 0.40 <= delta_abs <= 0.60:
         score += 20
     elif 0.30 <= delta_abs < 0.40 or 0.60 < delta_abs <= 0.70:
         score += 8
@@ -106,7 +111,7 @@ def _contract_score(e, direction: str) -> float:
               (direction == "BEARISH" and side == "CALL")
     if aligned:
         score += 15
-    elif contra and delta_abs >= 0.35:
+    elif contra and (_raw_delta is None or delta_abs >= 0.35):
         score += 5   # meaningful hedge — keep but score lower
 
     return score
@@ -1097,6 +1102,121 @@ def _fmt_final_verdict(
     return "\n".join(lines)
 
 
+# ── BOT_DATA block assembly helper ───────────────────────────────────────────
+
+def _get_primary_secondary_futures(
+    market_state: str,
+    indices: Optional["IndexRS"],
+    direction: str,
+    confidence: int,
+    rs_data: Optional["MarketRS"],
+) -> tuple[str, str]:
+    """
+    Return (primary, secondary) futures instrument names.
+    Reuses the same scoring logic as _fmt_conviction_rank but returns
+    the names directly instead of a formatted string.
+    """
+    if not indices or not indices.data_ok:
+        return "NONE", "NONE"
+
+    decisions = {
+        "NQ":  _nq_decision(indices, market_state, confidence)[0],
+        "ES":  _es_decision(indices, market_state, confidence)[0],
+        "RTY": _rty_decision(indices, market_state)[0],
+        "YM":  _ym_decision(indices, market_state)[0],
+    }
+
+    def _score(inst: str, action: str) -> float:
+        if action == "NO TRADE":
+            return -1.0
+        import math as _math
+        s = 0.0
+        ref_pct = {
+            "NQ":  abs(indices.qqq_pct_vs_vwap or 0.0),
+            "ES":  abs(indices.spy_pct_vs_vwap  or 0.0),
+            "RTY": abs(indices.iwm_pct_vs_vwap  or 0.0),
+            "YM":  abs(indices.spy_pct_vs_vwap  or 0.0),
+        }.get(inst, 0.0)
+        s += min(30.0, ref_pct * 20.0)
+        if indices.spy_above_vwap is not None and indices.qqq_above_vwap is not None:
+            if indices.spy_above_vwap == indices.qqq_above_vwap:
+                s += 20.0
+        iwm = indices.iwm_above_vwap
+        if iwm is not None:
+            confirms = (action == "LONG" and iwm) or (action == "SHORT" and not iwm)
+            if confirms:
+                s += 15.0
+        s += confidence * 0.20
+        if rs_data and rs_data.tickers:
+            aligned = sum(
+                1 for t in rs_data.tickers.values()
+                if (action == "LONG"  and t.classification == "STRONG") or
+                   (action == "SHORT" and t.classification == "WEAK")
+            )
+            s += min(15.0, aligned * 7.0)
+        if inst in ("RTY", "YM"):
+            s -= 5.0
+        return s
+
+    ranked = sorted(
+        [(inst, act, _score(inst, act)) for inst, act in decisions.items()],
+        key=lambda x: x[2], reverse=True,
+    )
+    eligible = [inst for inst, act, sc in ranked if sc >= 0]
+    primary   = eligible[0] if len(eligible) >= 1 else "NONE"
+    secondary = eligible[1] if len(eligible) >= 2 else "NONE"
+    return primary, secondary
+
+
+def _append_bot_data_block(
+    human_text: str,
+    *,
+    direction: str,
+    hedging: bool,
+    macro_override: bool,
+    confidence: int,
+    market_state: str,
+    primary: str,
+    secondary: str,
+    leaders: list,
+    drags: list,
+    session: str,
+    data_quality: str,
+    rs_data: Optional["MarketRS"] = None,
+) -> str:
+    """
+    Build and append the [BOT_DATA]...[/BOT_DATA] block to a human-readable
+    report string.  Never raises — returns original text on any error.
+    """
+    try:
+        indices = rs_data.indices if (rs_data and rs_data.data_ok) else None
+
+        block = build_bot_data(
+            bias=direction,
+            hedging=hedging,
+            confidence=confidence,
+            regime_raw=market_state,
+            primary_futures=primary,
+            secondary_futures=secondary,
+            leaders=list(leaders),
+            drags=list(drags),
+            session=session,
+            data_quality=data_quality,
+            macro_override=macro_override,
+            qqq_vwap=getattr(indices, "qqq_vwap", None) if indices else None,
+            qqq_price=getattr(indices, "qqq_price", None) if indices else None,
+            qqq_pm_high=None,
+            qqq_pm_low=getattr(indices, "qqq_pm_low", None) if indices else None,
+            spy_vwap=getattr(indices, "spy_vwap", None) if indices else None,
+            spy_price=getattr(indices, "spy_price", None) if indices else None,
+            spy_pm_high=None,
+            spy_pm_low=getattr(indices, "spy_pm_low", None) if indices else None,
+        )
+        return human_text + "\n\n" + render_bot_data(block)
+    except Exception:
+        return human_text
+
+
 # ── Channel B: new structured report ─────────────────────────────────────────
 
 def format_channel_b_report(analysis: dict, rs_data: Optional["MarketRS"] = None) -> str:
@@ -1286,7 +1406,34 @@ def format_channel_b_report(analysis: dict, rs_data: Optional["MarketRS"] = None
         bull_pct, bear_pct, actionable, bulls_list, bears_list,
     ))
 
-    return "\n".join(lines)
+    human_text = "\n".join(lines)
+
+    # ── BOT_DATA block (machine-readable) ─────────────────────────────────────
+    session = current_session()
+    dq_base = baseline_data_quality(session)
+    alpaca_ok  = bool(rs_data and rs_data.data_ok)
+    data_quality = degrade_data_quality(dq_base, alpaca_ok=alpaca_ok, tradier_ok=True)
+
+    primary, secondary = _get_primary_secondary_futures(
+        ms, rs_data.indices if (rs_data and rs_data.data_ok) else None,
+        effective_direction, confidence, rs_data,
+    )
+
+    return _append_bot_data_block(
+        human_text,
+        direction=effective_direction,
+        hedging=analysis.get("hedging", False),
+        macro_override=analysis.get("macro_override", False),
+        confidence=confidence,
+        market_state=ms,
+        primary=primary,
+        secondary=secondary,
+        leaders=analysis.get("leaders", []),
+        drags=analysis.get("drags", []),
+        session=session,
+        data_quality=data_quality,
+        rs_data=rs_data,
+    )
 
 
 # ── Pre-market forced report ──────────────────────────────────────────────────
@@ -1341,6 +1488,8 @@ def format_premarket_report(
     # Bias conclusion
     if not analysis or analysis.get("total", 0) == 0:
         lines.append("Bias: NEUTRAL → WAIT OPEN")
+        direction  = "NEUTRAL"
+        confidence = 0
     else:
         direction  = analysis["direction"]
         confidence = analysis["confidence"]
@@ -1349,7 +1498,26 @@ def format_premarket_report(
         else:
             lines.append(f"Bias: {direction} → WATCH OPEN CONFIRMATION")
 
-    return "\n".join(lines)
+    human_text = "\n".join(lines)
+
+    # ── BOT_DATA block (premarket — DATA_QUALITY always MEDIUM or LOW) ────────
+    session      = current_session()
+    data_quality = degrade_data_quality("MEDIUM", alpaca_ok=True, tradier_ok=False)
+
+    return _append_bot_data_block(
+        human_text,
+        direction=direction,
+        hedging=analysis.get("hedging", False) if analysis else False,
+        macro_override=analysis.get("macro_override", False) if analysis else False,
+        confidence=confidence,
+        market_state="NO_DATA",
+        primary="NONE",
+        secondary="NONE",
+        leaders=analysis.get("leaders", []) if analysis else [],
+        drags=analysis.get("drags", []) if analysis else [],
+        session=session,
+        data_quality=data_quality,
+    )
 
 
 # ── Channel B: legacy batch report (kept for /testsignal) ────────────────────
@@ -1629,7 +1797,49 @@ def format_aggregated_report_b(report, rs_data: Optional["MarketRS"] = None) -> 
         report.top_bears,
     ))
 
-    return "\n".join(lines)
+    human_text = "\n".join(lines)
+
+    # ── BOT_DATA block (machine-readable) ─────────────────────────────────────
+    session = current_session()
+    dq_base = baseline_data_quality(session)
+    alpaca_ok  = bool(rs_data and rs_data.data_ok)
+    data_quality = degrade_data_quality(dq_base, alpaca_ok=alpaca_ok, tradier_ok=True)
+
+    primary, secondary = _get_primary_secondary_futures(
+        ms,
+        rs_data.indices if (rs_data and rs_data.data_ok) else None,
+        effective_direction,
+        report.confidence,
+        rs_data,
+    )
+
+    # Extract leaders/drags from parsed flow entries
+    _aligned  = "CALL" if effective_direction == "BULLISH" else "PUT"
+    _opposed  = "PUT"  if effective_direction == "BULLISH" else "CALL"
+    leaders = list(dict.fromkeys(
+        e.ticker for e in (report.top_bulls if effective_direction == "BULLISH" else report.top_bears)
+        if getattr(e, "side", "") == _aligned
+    ))[:5]
+    drags = list(dict.fromkeys(
+        e.ticker for e in (report.top_bears if effective_direction == "BULLISH" else report.top_bulls)
+        if getattr(e, "side", "") == _opposed
+    ))[:5]
+
+    return _append_bot_data_block(
+        human_text,
+        direction=effective_direction,
+        hedging=False,   # IntelReport doesn't track hedging — safe default
+        macro_override=False,
+        confidence=report.confidence,
+        market_state=ms,
+        primary=primary,
+        secondary=secondary,
+        leaders=leaders,
+        drags=drags,
+        session=session,
+        data_quality=data_quality,
+        rs_data=rs_data,
+    )
 
 
 # ── On-demand command formatters ─────────────────────────────────────────────
@@ -1645,13 +1855,14 @@ def _hot_options_score(e, direction: str) -> float:
     """
     import math
 
-    delta_abs = abs(getattr(e, "delta", 0) or 0)
-    vol_oi    = getattr(e, "vol_oi_ratio", 0) or 0
-    premium   = getattr(e, "premium_usd", 0) or 0
-    dte       = getattr(e, "dte", 0) or 0
-    side      = getattr(e, "side", "")
-    cls       = getattr(e, "classification", "")
-    ticker    = getattr(e, "ticker", "")
+    _raw_delta = getattr(e, "delta", None)
+    delta_abs  = abs(_raw_delta) if _raw_delta is not None else 0.0
+    vol_oi     = getattr(e, "vol_oi_ratio", 0) or 0
+    premium    = getattr(e, "premium_usd", 0) or 0
+    dte        = getattr(e, "dte", 0) or 0
+    side       = getattr(e, "side", "")
+    cls        = getattr(e, "classification", "")
+    ticker     = getattr(e, "ticker", "")
 
     score = 0.0
 
@@ -1669,13 +1880,18 @@ def _hot_options_score(e, direction: str) -> float:
     elif vol_oi >= 2:
         score += 8
 
-    # Delta quality — prefer near-ATM (0.40–0.65)
-    if 0.40 <= delta_abs <= 0.65:
+    # Delta quality — prefer near-ATM (0.40–0.65).
+    # None means delta was not reported in the flow alert — give a neutral 8 pts
+    # so these valid signals are not silently buried below the floor.
+    if _raw_delta is None:
+        score += 8    # unknown delta: assume tradeable, no bonus, no penalty
+    elif 0.40 <= delta_abs <= 0.65:
         score += 20
     elif 0.30 <= delta_abs < 0.40 or 0.65 < delta_abs <= 0.75:
         score += 10
     elif delta_abs > 0.75:
         score += 4   # deep ITM: less levered, lower urgency
+    # delta_abs == 0.0 and raw_delta is not None → genuinely zero delta → 0 pts
 
     # DTE urgency — tighter expiries command attention
     if 1 <= dte <= 3:
@@ -1806,8 +2022,11 @@ def _hot_options_quick_take(entries: list, direction: str) -> list[str]:
     return bullets[:3]
 
 
-# Minimum composite score a contract must reach to appear in any /options output
-_HOT_OPTIONS_MIN_SCORE: float = 55.0
+# Minimum composite score a contract must reach to appear in any /options output.
+# Set to 45 — signals have already cleared hard filters (score, conviction, vol/oi,
+# premium, DTE). The floor only needs to exclude the weakest combinaton of valid
+# attributes, not re-apply the hard filters.
+_HOT_OPTIONS_MIN_SCORE: float = 45.0
 
 
 def format_hot_options(
@@ -1851,7 +2070,13 @@ def format_hot_options(
         pool = [e for e in pool if filter_fn(e)]
 
     if not pool:
-        return f"{label}\n\nNo high-quality hot options right now."
+        total = len(entries)
+        reason = (
+            f"0 of {total} recent signal(s) passed filters "
+            f"(all were LOTTERY / NOISE / DTE out of range)."
+            if total else "No signals in the last 30 minutes."
+        )
+        return f"{label}\n\nNo hot options right now. {reason}"
 
     # Score every candidate
     scored_all = sorted(
@@ -1861,10 +2086,18 @@ def format_hot_options(
     )
 
     # Apply minimum score floor
-    scored_all = [(s, e) for s, e in scored_all if s >= _HOT_OPTIONS_MIN_SCORE]
+    passed = [(s, e) for s, e in scored_all if s >= _HOT_OPTIONS_MIN_SCORE]
 
-    if not scored_all:
-        return f"{label}\n\nNo high-quality hot options right now."
+    if not passed:
+        best = scored_all[0][0] if scored_all else 0
+        return (
+            f"{label}\n\n"
+            f"No hot options right now. "
+            f"{len(pool)} signal(s) scanned, best score {best:.0f} "
+            f"(floor {_HOT_OPTIONS_MIN_SCORE:.0f}). "
+            f"Flow may be too mixed or low-conviction."
+        )
+    scored_all = passed
 
     # De-duplicate by ticker — keep the top max_per_ticker per ticker by score
     ticker_count: dict[str, int] = {}

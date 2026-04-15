@@ -57,6 +57,7 @@ from app.telegram_handler import (
     _INDEX_HEDGE_TICKERS,
 )
 from app.intel_parser import is_aggregated_report, parse_intel_report
+from app.session import current_session
 from app.rs_engine import compute_rs
 from app.scheduler import Scheduler, SignalWindow, _slot_key
 from app.classifier import classify_flow
@@ -818,6 +819,78 @@ async def main() -> None:
         ts_str = ts.strftime("%Y-%m-%d %H:%M ET") if ts else "unknown time"
         await update.message.reply_text(f"[Cached {ts_str}]\n\n{text}")
 
+    # ── /debug — dump sig_window state so we can diagnose empty /options ─────────
+
+    async def cmd_debug(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not _is_allowed(update):
+            await _deny(update); return
+        try:
+            from app.telegram_handler import _hot_options_score, _HOT_OPTIONS_MIN_SCORE
+
+            now_et    = _now_et()
+            session   = current_session(now_et)
+            entries   = sig_window.fresh()
+            ana       = _analyze(entries) if entries else {}
+            direction = ana.get("direction", "NEUTRAL")
+
+            lines = [
+                "DEBUG — sig_window state",
+                f"Time (ET):   {now_et.strftime('%Y-%m-%d %H:%M:%S')}",
+                f"Session:     {session}",
+                f"In window:   {len(entries)} signal(s) (last 30 min)",
+                f"Direction:   {direction}",
+                f"Score floor: {_HOT_OPTIONS_MIN_SCORE}",
+                "",
+            ]
+
+            if not entries:
+                lines += [
+                    "Window is EMPTY — nothing to show for /options.",
+                    "",
+                    "Signals reach sig_window ONLY when:",
+                    "  1. Session is RTH (09:30-16:00 ET)",
+                    "  2. A raw individual flow alert arrives in source channel",
+                    "  3. It parses successfully (ticker/strike/expiry/score/conviction)",
+                    "",
+                    "NOTE: Aggregated reports (MARKET BIAS + TOP BULLS sections)",
+                    "are formatted & posted but do NOT add entries to sig_window.",
+                    "If your source only sends aggregated reports, window stays empty.",
+                ]
+            else:
+                lines.append(f"{'#':<3} {'Tkr':<7} {'Side':<5} {'DTE':<4} {'Delta':<7} {'VoI':<5} {'Score':<6} Status")
+                lines.append("─" * 58)
+                for i, e in enumerate(entries, 1):
+                    dte   = getattr(e, "dte", 0)
+                    delta = getattr(e, "delta", None)
+                    voi   = getattr(e, "vol_oi_ratio", 0)
+                    cls   = getattr(e, "classification", "")
+                    role  = getattr(e, "signal_role", "")
+
+                    in_pool = cls != "LOTTERY" and role != "NOISE" and 1 <= dte <= 30
+                    score   = round(_hot_options_score(e, direction), 1) if in_pool else 0.0
+                    passes  = in_pool and score >= _HOT_OPTIONS_MIN_SCORE
+
+                    if not in_pool:
+                        if cls == "LOTTERY":       status = "SKIP:LOTTERY"
+                        elif role == "NOISE":      status = "SKIP:NOISE"
+                        elif not (1 <= dte <= 30): status = f"SKIP:DTE={dte}"
+                        else:                      status = "SKIP"
+                    elif not passes:
+                        status = f"LOW score={score}"
+                    else:
+                        status = f"OK  score={score}"
+
+                    d_str = f"{delta:+.2f}" if delta is not None else "N/A"
+                    lines.append(
+                        f"{i:<3} {e.ticker:<7} {e.side:<5} {dte:<4} "
+                        f"{d_str:<7} {voi:<5.1f} {score:<6.1f} {status}"
+                    )
+
+            await update.message.reply_text("\n".join(lines))
+        except Exception as exc:
+            logger.error("/debug failed: %s", exc, exc_info=True)
+            await update.message.reply_text(f"Debug failed: {exc}")
+
     # ── Register manual command handlers ──────────────────────────────────────
 
     for _cmd, _fn in [
@@ -841,6 +914,8 @@ async def main() -> None:
         ("ym",         cmd_ym),
         # Cache
         ("last",       cmd_last),
+        # Diagnostics
+        ("debug",      cmd_debug),
     ]:
         application.add_handler(CommandHandler(_cmd, _fn))
 

@@ -10,10 +10,15 @@ Trade modes:
   BEARISH → FAILED BOUNCE SHORT
   BULLISH → DIP BUY
   CHOP    → PAIR TRADE
+
+v2: adds hedge detection (hedge_detector), leaders/drags extraction, and
+    macro_override flag — all consumed by bot_data.BotDataBlock.
 """
 
 import logging
 from dataclasses import dataclass
+from typing import Optional
+from app.hedge_detector import is_hedging, classify_hedge
 
 logger = logging.getLogger(__name__)
 
@@ -33,7 +38,7 @@ class BatchEntry:
     strike: float = 0.0
     iv_pct: float = 0.0
     vol_oi_ratio: float = 0.0
-    delta: float = 0.0
+    delta: Optional[float] = None   # None = not reported (not zero delta)
     dte: int = 0
     direction: str = "NEUTRAL"
 
@@ -64,7 +69,7 @@ class BatchStore:
             strike=getattr(sig, "strike", 0.0),
             iv_pct=getattr(sig, "iv_pct", 0.0),
             vol_oi_ratio=getattr(sig, "vol_oi_ratio", 0.0),
-            delta=getattr(sig, "delta", 0.0) or 0.0,
+            delta=getattr(sig, "delta", None),   # preserve None — do not coerce to 0.0
             dte=getattr(sig, "dte", 0),
             direction=getattr(sig, "direction", "NEUTRAL"),
         ))
@@ -119,7 +124,10 @@ def _analyze(entries: list[BatchEntry]) -> dict:
     confidence = min(100, diff + hedge_count * 10)
     direction  = "BULLISH" if bull_pct >= bear_pct else "BEARISH"
 
-    if hedge_count >= 2:
+    # Hedge detection — use the dedicated detector (not just classification label)
+    hedging = is_hedging(entries, direction)
+
+    if hedge_count >= 2 or hedging:
         subtype = "HEDGED"
     elif positional:
         subtype = "POSITIONAL"
@@ -129,9 +137,9 @@ def _analyze(entries: list[BatchEntry]) -> dict:
     # ── Market state ──────────────────────────────────────────────────────────
     if confidence < 20:
         state = "CHOP"
-    elif hedge_count >= 2 and bull_pct > 55:
+    elif (hedge_count >= 2 or hedging) and bull_pct > 55:
         state = "BULLISH WITH HEDGING"
-    elif hedge_count >= 2 and bear_pct > 55:
+    elif (hedge_count >= 2 or hedging) and bear_pct > 55:
         state = "DISTRIBUTION"
     elif bull_pct >= 70 or bear_pct >= 70:
         state = "TREND"
@@ -182,7 +190,7 @@ def _analyze(entries: list[BatchEntry]) -> dict:
 
     # ── Tags ──────────────────────────────────────────────────────────────────
     tags: list[str] = []
-    if hedge_count >= 2:
+    if hedge_count >= 2 or hedging:
         tags.append("HEDGE_CLUSTER")
     if confidence < 20:
         tags.append("LOW_CONVICTION")
@@ -190,6 +198,35 @@ def _analyze(entries: list[BatchEntry]) -> dict:
         tags.append("BROAD_MARKET")
     if len(entries) >= 5:
         tags.append("HIGH_VOLUME_SESSION")
+
+    # ── Leaders / Drags (for BOT_DATA block) ─────────────────────────────────
+    # Leaders: non-index tickers whose flow ALIGNS with overall direction
+    # Drags:   non-index tickers whose flow OPPOSES overall direction
+    from app.classifier import MARKET_TICKERS  # local import avoids circular dep
+    _aligned_side  = "CALL" if direction == "BULLISH" else "PUT"
+    _opposed_side  = "PUT"  if direction == "BULLISH" else "CALL"
+
+    leaders_set: list[str] = []
+    drags_set: list[str]   = []
+    seen_leaders: set[str] = set()
+    seen_drags:   set[str] = set()
+
+    for e in sorted(entries, key=lambda x: x.premium_usd, reverse=True):
+        if e.ticker in MARKET_TICKERS:
+            continue
+        if e.side == _aligned_side and e.ticker not in seen_leaders:
+            leaders_set.append(e.ticker)
+            seen_leaders.add(e.ticker)
+        elif e.side == _opposed_side and e.ticker not in seen_drags:
+            drags_set.append(e.ticker)
+            seen_drags.add(e.ticker)
+
+    leaders = leaders_set[:5]
+    drags   = drags_set[:5]
+
+    # ── Macro override — market/index signals dominate the batch ─────────────
+    # True when ≥2 distinct market-tier tickers appear in the batch
+    macro_override = len({e.ticker for e in mkt_signals}) >= 2
 
     return {
         "total":           total,
@@ -201,6 +238,10 @@ def _analyze(entries: list[BatchEntry]) -> dict:
         "bull_pct":        bull_pct,
         "bear_pct":        bear_pct,
         "confidence":      confidence,
+        "hedging":         hedging,
+        "macro_override":  macro_override,
+        "leaders":         leaders,
+        "drags":           drags,
         "drivers":         drivers,
         "high_conviction": high_conviction,
         "speculative":     speculative,
