@@ -936,14 +936,16 @@ async def main() -> None:
                 lines += [
                     "Window is EMPTY — nothing to show for /options.",
                     "",
-                    "Signals reach sig_window ONLY when:",
+                    "Signals reach sig_window when:",
                     "  1. Session is RTH (09:30-16:00 ET)",
-                    "  2. A raw individual flow alert arrives in source channel",
-                    "  3. It parses successfully (ticker/strike/expiry/score/conviction)",
+                    "  2. A message arrives in source channel",
+                    "  3. Raw flow alert: parses directly → added to window",
+                    "  4. Aggregated report (MARKET BIAS / TOP BULLS): each",
+                    "     flow entry is converted and added to window",
                     "",
-                    "NOTE: Aggregated reports (MARKET BIAS + TOP BULLS sections)",
-                    "are formatted & posted but do NOT add entries to sig_window.",
-                    "If your source only sends aggregated reports, window stays empty.",
+                    "Window is empty because no source message has arrived yet",
+                    "since the bot last restarted. Send /debug again after the",
+                    "next report comes in from the source channel.",
                 ]
             else:
                 lines.append(f"{'#':<3} {'Tkr':<7} {'Side':<5} {'DTE':<4} {'Delta':<7} {'VoI':<5} {'Score':<6} Status")
