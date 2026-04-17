@@ -53,10 +53,19 @@ class FlowSignal:
     option_ask: Optional[float] = None
     option_mid: Optional[float] = None     # (bid + ask) / 2 — preferred over last
     option_quote_time: Optional[str] = None
+    # Locked signal-time premium — set once after quote fetch, never updated from live chain.
+    # Fallback order: mid → mark → last. Source of truth for all alerts and DB records.
+    premium_at_signal: Optional[float] = None
     signal_id: str = field(init=False)
 
     def __post_init__(self):
         self.signal_id = f"{self.ticker}_{self.side}_{self.strike}_{self.expiration.isoformat()}"
+
+    def lock_signal_premium(self) -> None:
+        """Call immediately after option quote is fetched. Locks premium_at_signal once."""
+        if self.premium_at_signal is not None:
+            return  # already locked — never overwrite
+        self.premium_at_signal = self.option_mid or self.option_last or None
 
 
 def _parse_premium(raw: str) -> float:

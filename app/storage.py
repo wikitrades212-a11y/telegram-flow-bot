@@ -64,7 +64,8 @@ def init_db() -> None:
             )
         """)
         # Migrate existing DB — ignored if columns already exist
-        for _col in ("result_30m TEXT", "move_30m REAL", "classification TEXT"):
+        for _col in ("result_30m TEXT", "move_30m REAL", "classification TEXT",
+                     "premium_at_signal REAL"):
             try:
                 conn.execute(f"ALTER TABLE signals ADD COLUMN {_col}")
             except sqlite3.OperationalError:
@@ -101,13 +102,15 @@ def record_signal(sig, price, state: str = "HOLD", classification: str = None) -
             INSERT OR IGNORE INTO signals
                 (signal_id, ticker, side, strike, expiration,
                  premium_usd, delta, score, conviction,
-                 state, timestamp_signal, price_at_signal, classification)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 state, timestamp_signal, price_at_signal, classification,
+                 premium_at_signal)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             sig.signal_id, sig.ticker, sig.side, sig.strike,
             sig.expiration.isoformat(), sig.premium_usd, sig.delta,
             sig.score, sig.conviction, state,
             datetime.utcnow().isoformat(), price, classification,
+            getattr(sig, "premium_at_signal", None),
         ))
 
 

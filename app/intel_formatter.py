@@ -27,24 +27,30 @@ def format_intel(
     contract = f"${sig.strike}{sig.side[0]} {sig.expiration.strftime('%-d %b')}"
     delta_str = f"{sig.delta:.2f}" if sig.delta is not None else "N/A"
 
+    opt_prem = getattr(sig, "premium_at_signal", None)
+    opt_prem_str = f"${opt_prem:.2f}" if opt_prem else "N/A"
+    direction = "BULLISH" if sig.side == "CALL" else "BEARISH"
+
     lines = [
         "📊 <b>FLOW INTELLIGENCE</b>",
         "<pre>",
         "FLOW:",
-        f"  ticker:         {sig.ticker}",
-        f"  contract:       {contract}",
-        f"  type:           {sig.side}",
-        f"  premium:        {_fmt_premium(sig.premium_usd)}",
-        f"  iv:             {sig.iv_pct:.1f}%",
-        f"  iv_bucket:      {iv_bucket(sig.iv_pct)}",
-        f"  vol_oi:         {sig.vol_oi_ratio:.1f}x",
-        f"  delta:          {delta_str}",
-        f"  dte:            {sig.dte}",
-        f"  aggression:     {aggression_label(sig.vol_oi_ratio)}",
-        f"  participant:    {participant_label(sig.premium_usd)}",
-        f"  classification: {classification}",
-        f"  signal_role:    {signal_role}",
-        f"  priority:       {priority}",
+        f"  ticker:             {sig.ticker}",
+        f"  contract:           {contract}",
+        f"  direction:          {direction}",
+        f"  type:               {sig.side}",
+        f"  notional:           {_fmt_premium(sig.premium_usd)}",
+        f"  premium_at_signal:  {opt_prem_str}",
+        f"  iv:                 {sig.iv_pct:.1f}%",
+        f"  iv_bucket:          {iv_bucket(sig.iv_pct)}",
+        f"  vol_oi:             {sig.vol_oi_ratio:.1f}x",
+        f"  delta:              {delta_str}",
+        f"  dte:                {sig.dte}",
+        f"  aggression:         {aggression_label(sig.vol_oi_ratio)}",
+        f"  participant:        {participant_label(sig.premium_usd)}",
+        f"  classification:     {classification}",
+        f"  signal_role:        {signal_role}",
+        f"  priority:           {priority}",
         "</pre>",
     ]
     return "\n".join(lines)

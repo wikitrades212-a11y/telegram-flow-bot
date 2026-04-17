@@ -1120,6 +1120,7 @@ async def main() -> None:
             return
 
         await fetch_option_quote(sig)
+        sig.lock_signal_premium()   # lock mid/last as premium_at_signal — never updated again
 
         # ── Classify → Channel A (INTEL_CHANNEL) ─────────────────────────────
         cls, role, pri = classify_flow(sig)

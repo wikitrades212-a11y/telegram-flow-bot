@@ -2543,9 +2543,22 @@ def format_hold(sig: FlowSignal, dec: Decision) -> str:
 
 
 def format_go(sig: FlowSignal, dec: Decision) -> str:
+    from datetime import datetime
+    import pytz
+    _ET = pytz.timezone("America/New_York")
+    ts_et = datetime.now(_ET).strftime("%-I:%M %p ET")
+
     trigger_line = f"Trigger: {dec.trigger_reason}\n\n" if dec.trigger_reason else ""
+    direction = "BULLISH" if sig.side == "CALL" else "BEARISH"
+    exp_str = sig.expiration.strftime("%-m/%-d")
+    contract_label = f"{sig.ticker} {sig.strike:.0f}{sig.side[0]} {exp_str}"
+
+    opt_prem = sig.premium_at_signal
+    prem_line = f"Premium at signal: ${opt_prem:.2f}" if opt_prem else "Premium at signal: N/A"
+
     return (
-        f"{sig.ticker} {sig.side} FLOW\n"
+        f"{direction} — {contract_label} | {prem_line} | {ts_et}\n"
+        f"\n"
         f"Score: {sig.score} ({sig.conviction})\n"
         f"Decision: GO\n"
         f"\n"
