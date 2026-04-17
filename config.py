@@ -70,6 +70,12 @@ INTEL_CHANNEL: str = os.environ.get("INTEL_CHANNEL", "")
 # Number of signals that trigger a Channel B batch report.
 BATCH_SIGNAL_COUNT: int = int(os.environ.get("BATCH_SIGNAL_COUNT", "3"))
 
+# ── Local dashboard (optional) ────────────────────────────────────────────────
+# Set to your ngrok URL when running the dashboard locally, e.g.:
+#   https://abc123.ngrok-free.app/api/ingest
+# Leave empty to disable — bot operates normally without it.
+DASHBOARD_INGEST_URL: str = os.environ.get("DASHBOARD_INGEST_URL", "")
+
 # ── Tradier ───────────────────────────────────────────────────────────────────
 TRADIER_TOKEN: str = os.environ.get("TRADIER_TOKEN", "")
 

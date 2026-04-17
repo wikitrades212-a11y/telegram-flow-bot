@@ -7,6 +7,7 @@ so the bot never double-posts even across restarts.
 
 import sqlite3
 import logging
+import threading
 import warnings
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -95,8 +96,26 @@ def mark_sent(signal_id: str, verdict: str) -> None:
     logger.debug("Marked sent: %s / %s", signal_id, verdict)
 
 
+def _push_to_dashboard(payload: dict) -> None:
+    """
+    Fire-and-forget POST to the local dashboard ingest endpoint.
+    Runs in a background thread — never blocks record_signal().
+    Silently ignored if DASHBOARD_INGEST_URL is unset or the server is offline.
+    """
+    url = config.__dict__.get("DASHBOARD_INGEST_URL", "") or ""
+    if not url:
+        return
+    try:
+        import httpx
+        httpx.post(url, json=payload, timeout=2.0)
+    except Exception:
+        pass   # local server offline — ignore
+
+
 def record_signal(sig, price, state: str = "HOLD", classification: str = None) -> None:
     """Insert a new signal row. INSERT OR IGNORE — safe to call on duplicates."""
+    ts = datetime.utcnow().isoformat()
+    prem = getattr(sig, "premium_at_signal", None)
     with _connect() as conn:
         conn.execute("""
             INSERT OR IGNORE INTO signals
@@ -109,9 +128,30 @@ def record_signal(sig, price, state: str = "HOLD", classification: str = None) -
             sig.signal_id, sig.ticker, sig.side, sig.strike,
             sig.expiration.isoformat(), sig.premium_usd, sig.delta,
             sig.score, sig.conviction, state,
-            datetime.utcnow().isoformat(), price, classification,
-            getattr(sig, "premium_at_signal", None),
+            ts, price, classification, prem,
         ))
+
+    # Push copy to local dashboard (non-blocking, best-effort)
+    threading.Thread(
+        target=_push_to_dashboard,
+        args=({
+            "signal_id":         sig.signal_id,
+            "ticker":            sig.ticker,
+            "side":              sig.side,
+            "strike":            sig.strike,
+            "expiration":        sig.expiration.isoformat(),
+            "premium_usd":       sig.premium_usd,
+            "delta":             sig.delta,
+            "score":             sig.score,
+            "conviction":        sig.conviction,
+            "state":             state,
+            "timestamp_signal":  ts,
+            "price_at_signal":   price,
+            "classification":    classification,
+            "premium_at_signal": prem,
+        },),
+        daemon=True,
+    ).start()
 
 
 def update_signal_go(signal_id: str, price, ts: str) -> None:
