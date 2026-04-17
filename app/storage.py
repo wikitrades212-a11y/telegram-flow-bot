@@ -7,6 +7,7 @@ so the bot never double-posts even across restarts.
 
 import sqlite3
 import logging
+import warnings
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -15,6 +16,15 @@ import config
 logger = logging.getLogger(__name__)
 
 _DB = Path(config.DB_PATH)
+
+if not config.DB_PATH or not Path(config.DB_PATH).is_absolute():
+    warnings.warn(
+        "DB_PATH is not set to an absolute path — using ephemeral path "
+        f"'{config.DB_PATH}'. Signal history will be lost on redeploy. "
+        "Set DB_PATH=/data/signals.db and mount a Railway persistent volume at /data.",
+        RuntimeWarning,
+        stacklevel=2,
+    )
 
 
 def init_db() -> None:
