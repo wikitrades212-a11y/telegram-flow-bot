@@ -114,22 +114,54 @@ def _analyze(entries: list[BatchEntry]) -> dict:
     if not entries:
         return {}
 
+    from app.hedge_detector import classify_hedge, HEDGE_TYPE_HEDGE, HEDGE_TYPE_PROBABLE
+    from app.classifier import MARKET_TICKERS
+
     total    = len(entries)
     bull     = [e for e in entries if e.side == "CALL"]
     bear     = [e for e in entries if e.side == "PUT"]
     bull_pct = round(len(bull) / total * 100)
     bear_pct = 100 - bull_pct
 
-    hedge_count = sum(1 for e in entries if e.classification == "HEDGE_DIRECTIONAL")
+    # ── Classify entries as SPEC vs HEDGE ─────────────────────────────────────
+    # Bootstrap direction from raw flow, then use it for hedge classification.
+    raw_direction = "BULLISH" if bull_pct >= bear_pct else "BEARISH"
+
+    hedge_entries: list[BatchEntry] = []
+    spec_entries:  list[BatchEntry] = []
+    for e in entries:
+        hr = classify_hedge(
+            side=e.side,
+            delta=e.delta,
+            vol_oi_ratio=e.vol_oi_ratio,
+            premium_usd=e.premium_usd,
+            market_direction=raw_direction,
+        )
+        if hr.hedge_type in (HEDGE_TYPE_HEDGE, HEDGE_TYPE_PROBABLE):
+            hedge_entries.append(e)
+        else:
+            spec_entries.append(e)
+
+    # ── Bias from SPEC flow only (hedges excluded) ────────────────────────────
+    spec_total    = len(spec_entries)
+    spec_bull_pct = round(sum(1 for e in spec_entries if e.side == "CALL") / spec_total * 100) if spec_total else bull_pct
+    spec_bear_pct = 100 - spec_bull_pct
+
+    spec_diff = abs(spec_bull_pct - spec_bear_pct)
+    if spec_diff < 10:
+        direction = "NEUTRAL"
+    elif spec_bull_pct >= spec_bear_pct:
+        direction = "BULLISH"
+    else:
+        direction = "BEARISH"
+
+    # bias_confidence: how lopsided spec flow is — hedges do NOT inflate this
+    bias_confidence = min(100, spec_diff * 2)
+
+    hedge_count = len(hedge_entries)
     positional  = [e for e in entries if "POSITIONAL" in e.classification]
     mkt_signals = [e for e in entries if e.signal_role == "MARKET_SIGNAL"]
 
-    # ── Bias ──────────────────────────────────────────────────────────────────
-    diff       = abs(bull_pct - bear_pct)
-    confidence = min(100, diff + hedge_count * 10)
-    direction  = "BULLISH" if bull_pct >= bear_pct else "BEARISH"
-
-    # Hedge detection — use the dedicated detector (not just classification label)
     hedging = is_hedging(entries, direction)
 
     if hedge_count >= 2 or hedging:
@@ -140,15 +172,15 @@ def _analyze(entries: list[BatchEntry]) -> dict:
         subtype = "SPECULATIVE"
 
     # ── Market state ──────────────────────────────────────────────────────────
-    if confidence < 20:
+    if bias_confidence < 20:
         state = "CHOP"
-    elif (hedge_count >= 2 or hedging) and bull_pct > 55:
+    elif (hedge_count >= 2 or hedging) and spec_bull_pct > 55:
         state = "BULLISH WITH HEDGING"
-    elif (hedge_count >= 2 or hedging) and bear_pct > 55:
+    elif (hedge_count >= 2 or hedging) and spec_bear_pct > 55:
         state = "DISTRIBUTION"
-    elif bull_pct >= 70 or bear_pct >= 70:
+    elif spec_bull_pct >= 70 or spec_bear_pct >= 70:
         state = "TREND"
-    elif 40 <= bull_pct <= 60 and not mkt_signals:
+    elif 40 <= spec_bull_pct <= 60 and not mkt_signals:
         state = "ROTATION"
     else:
         state = "CHOP"
@@ -164,14 +196,13 @@ def _analyze(entries: list[BatchEntry]) -> dict:
         mode        = "CHOP"
         trade_logic = "PAIR TRADE\nLong strong sector / short weak sector"
 
-    # ── Drivers: priority 1–2, market/sector first ────────────────────────────
+    # ── Drivers ───────────────────────────────────────────────────────────────
     drivers = [e for e in entries
                if e.priority <= 2 and e.signal_role in ("MARKET_SIGNAL", "SECTOR_SIGNAL")]
     if not drivers:
         drivers = sorted([e for e in entries if e.priority <= 2], key=lambda x: x.priority)
 
     # ── Trade candidates ──────────────────────────────────────────────────────
-    # Ignore GAMMA_VOL and LOTTERY per spec
     actionable = [e for e in entries
                   if e.classification not in ("GAMMA_VOL", "LOTTERY")
                   and e.decision != "KILL"]
@@ -186,9 +217,8 @@ def _analyze(entries: list[BatchEntry]) -> dict:
              or e.priority >= 4]
 
     # ── Sectors ───────────────────────────────────────────────────────────────
-    bull_sec  = sorted({e.ticker for e in bull if e.signal_role == "SECTOR_SIGNAL"})
-    bear_sec  = sorted({e.ticker for e in bear if e.signal_role == "SECTOR_SIGNAL"})
-    # Tickers appearing on both sides are neutral
+    bull_sec    = sorted({e.ticker for e in bull  if e.signal_role == "SECTOR_SIGNAL"})
+    bear_sec    = sorted({e.ticker for e in bear  if e.signal_role == "SECTOR_SIGNAL"})
     neutral_sec = sorted(set(bull_sec) & set(bear_sec))
     bull_sec    = [t for t in bull_sec if t not in neutral_sec]
     bear_sec    = [t for t in bear_sec if t not in neutral_sec]
@@ -197,63 +227,76 @@ def _analyze(entries: list[BatchEntry]) -> dict:
     tags: list[str] = []
     if hedge_count >= 2 or hedging:
         tags.append("HEDGE_CLUSTER")
-    if confidence < 20:
+    if bias_confidence < 20:
         tags.append("LOW_CONVICTION")
     if len({e.ticker for e in mkt_signals}) >= 2:
         tags.append("BROAD_MARKET")
     if len(entries) >= 5:
         tags.append("HIGH_VOLUME_SESSION")
 
-    # ── Leaders / Drags (for BOT_DATA block) ─────────────────────────────────
-    # Leaders: non-index tickers whose flow ALIGNS with overall direction
-    # Drags:   non-index tickers whose flow OPPOSES overall direction
-    from app.classifier import MARKET_TICKERS  # local import avoids circular dep
-    _aligned_side  = "CALL" if direction == "BULLISH" else "PUT"
-    _opposed_side  = "PUT"  if direction == "BULLISH" else "CALL"
+    # ── Leaders / Drags — single source of truth ──────────────────────────────
+    # A ticker that appears on BOTH sides → MIXED (excluded from leaders & drags).
+    # A ticker can never be in both leaders and drags.
+    _aligned_side = "CALL" if direction == "BULLISH" else "PUT"
+    _opposed_side = "PUT"  if direction == "BULLISH" else "CALL"
 
-    leaders_set: list[str] = []
-    drags_set: list[str]   = []
-    seen_leaders: set[str] = set()
-    seen_drags:   set[str] = set()
-
-    for e in sorted(entries, key=lambda x: x.premium_usd, reverse=True):
+    ticker_sides: dict[str, set] = {}
+    for e in entries:
         if e.ticker in MARKET_TICKERS:
             continue
-        if e.side == _aligned_side and e.ticker not in seen_leaders:
-            leaders_set.append(e.ticker)
-            seen_leaders.add(e.ticker)
-        elif e.side == _opposed_side and e.ticker not in seen_drags:
-            drags_set.append(e.ticker)
-            seen_drags.add(e.ticker)
+        ticker_sides.setdefault(e.ticker, set()).add(e.side)
 
-    leaders = leaders_set[:5]
-    drags   = drags_set[:5]
+    mixed_tickers = sorted(t for t, sides in ticker_sides.items() if len(sides) == 2)
 
-    # ── Macro override — market/index signals dominate the batch ─────────────
-    # True when ≥2 distinct market-tier tickers appear in the batch
+    leaders_list: list[str] = []
+    drags_list:   list[str] = []
+    seen_all:     set[str]  = set()
+
+    for e in sorted(entries, key=lambda x: x.premium_usd, reverse=True):
+        if e.ticker in MARKET_TICKERS or e.ticker in mixed_tickers:
+            continue
+        if e.ticker in seen_all:
+            continue
+        seen_all.add(e.ticker)
+        if e.side == _aligned_side:
+            leaders_list.append(e.ticker)
+        elif e.side == _opposed_side:
+            drags_list.append(e.ticker)
+
+    leaders = leaders_list[:5]
+    drags   = drags_list[:5]
+    mixed   = mixed_tickers[:3]
+
+    # ── Macro override ─────────────────────────────────────────────────────────
     macro_override = len({e.ticker for e in mkt_signals}) >= 2
 
     return {
-        "total":           total,
-        "state":           state,
-        "mode":            mode,
-        "trade_logic":     trade_logic,
-        "direction":       direction,
-        "subtype":         subtype,
-        "bull_pct":        bull_pct,
-        "bear_pct":        bear_pct,
-        "confidence":      confidence,
-        "hedging":         hedging,
-        "macro_override":  macro_override,
-        "leaders":         leaders,
-        "drags":           drags,
-        "drivers":         drivers,
-        "high_conviction": high_conviction,
-        "speculative":     speculative,
-        "noise":           noise,
-        "sectors_strong":  bull_sec if direction == "BULLISH" else bear_sec,
-        "sectors_weak":    bear_sec if direction == "BULLISH" else bull_sec,
-        "sectors_neutral": neutral_sec,
-        "tags":            tags,
-        "entries":         entries,
+        "total":            total,
+        "state":            state,
+        "mode":             mode,
+        "trade_logic":      trade_logic,
+        "direction":        direction,
+        "subtype":          subtype,
+        "bull_pct":         bull_pct,
+        "bear_pct":         bear_pct,
+        "spec_bull_pct":    spec_bull_pct,
+        "spec_bear_pct":    spec_bear_pct,
+        "bias_confidence":  bias_confidence,
+        "confidence":       bias_confidence,   # backward-compat alias
+        "hedging":          hedging,
+        "hedge_entries":    hedge_entries,
+        "spec_entries":     spec_entries,
+        "macro_override":   macro_override,
+        "leaders":          leaders,
+        "drags":            drags,
+        "mixed":            mixed,
+        "drivers":          drivers,
+        "high_conviction":  high_conviction,
+        "speculative":      speculative,
+        "noise":            noise,
+        "sectors_strong":   bull_sec if direction == "BULLISH" else bear_sec,
+        "sectors_weak":     bear_sec if direction == "BULLISH" else bull_sec,
+        "sectors_neutral":  neutral_sec,
+        "tags":             tags,
+        "entries":          entries,
     }

@@ -240,6 +240,39 @@ class _T:
     CONFIDENCE_DIV_PENALTY:      float = 0.80
 
 
+# ── Alignment helper ─────────────────────────────────────────────────────────
+
+def _compute_alignment(direction: str, indices: Optional["IndexRS"]) -> str:
+    """ALIGNED when both SPY and QQQ VWAP positions confirm the flow direction."""
+    if not indices or not indices.data_ok:
+        return "UNKNOWN"
+    if direction == "BULLISH":
+        if indices.spy_above_vwap is True and indices.qqq_above_vwap is True:
+            return "ALIGNED"
+    elif direction == "BEARISH":
+        if indices.spy_above_vwap is False and indices.qqq_above_vwap is False:
+            return "ALIGNED"
+    return "NOT ALIGNED"
+
+
+# ── Simplified regime label ───────────────────────────────────────────────────
+
+def _simplified_regime(detailed_tag: str, hedging: bool) -> str:
+    """
+    Map the detailed regime tag to the simplified four-way label.
+    TRENDING / ROTATIONAL / HEDGED / CHOP
+    """
+    if detailed_tag in (
+        "BROAD TREND UP", "NARROW TECH-LED UP",
+        "BROAD TREND DOWN", "NARROW TECH-LED DOWN",
+        "DEFENSIVE RISK-OFF",
+    ):
+        return "HEDGED" if hedging else "TRENDING"
+    if detailed_tag == "ROTATIONAL CHOP":
+        return "ROTATIONAL"
+    return "CHOP"   # MIXED / UNTRADEABLE, NO_DATA, CHOP
+
+
 # ── Regime persistence tracker ───────────────────────────────────────────────
 
 class RegimeTracker:
@@ -905,26 +938,22 @@ def _fmt_execution_plan(
 def _fmt_final_verdict(
     market_state: str,
     direction: str,
-    flow_confidence: int,
+    bias_confidence: int,
+    execution_confidence: int,
+    simplified_regime: str,
+    alignment: str,
     rs_data: Optional["MarketRS"],
     bull_pct: int,
     bear_pct: int,
     entries_all: list,
-    entries_bull: list,
-    entries_bear: list,
+    leaders: list,
+    drags: list,
 ) -> str:
     """
-    Build FINAL VERDICT block. Always the last section.
-    Confidence is re-computed from rule-based scoring when rs_data is available.
+    Build FINAL VERDICT block.
+    Uses pre-computed bias_confidence, execution_confidence, simplified_regime,
+    and alignment — never recomputes them independently.
     """
-    # Structured confidence replaces the raw flow confidence when RS data is available
-    if rs_data and rs_data.data_ok:
-        confidence = _compute_structured_confidence(
-            direction, bull_pct, bear_pct, rs_data, entries_all
-        )
-    else:
-        confidence = flow_confidence
-
     state_label = {
         "TREND_UP":   "TREND UP",
         "TREND_DOWN": "TREND DOWN",
@@ -933,32 +962,55 @@ def _fmt_final_verdict(
         "NO_DATA":    "UNKNOWN",
     }.get(market_state, market_state)
 
-    # Confidence band label
-    if confidence <= 20:
-        band = "unusable / highly mixed"
-    elif confidence <= 40:
-        band = "weak edge"
-    elif confidence <= 60:
-        band = "tradable but not clean"
-    elif confidence <= 80:
-        band = "strong directional read"
+    # Execution confidence band
+    if execution_confidence <= 20:
+        exec_band = "no edge"
+    elif execution_confidence <= 40:
+        exec_band = "weak"
+    elif execution_confidence <= 60:
+        exec_band = "moderate"
+    elif execution_confidence <= 80:
+        exec_band = "strong"
     else:
-        band = "high alignment"
+        exec_band = "high"
+
+    # ── Tradability verdict ───────────────────────────────────────────────────
+    if execution_confidence < 25:
+        tradable     = "NO TRADE"
+        trade_reason = f"Execution confidence too low ({execution_confidence}/100) — wait for price/flow alignment"
+    elif simplified_regime == "CHOP":
+        tradable     = "NO TRADE"
+        trade_reason = "No edge — wait for SPY, QQQ, IWM to align above or below VWAP"
+    elif simplified_regime == "HEDGED":
+        tradable     = "HEDGE / WAIT"
+        trade_reason = "Heavy hedge flow suppressing directional conviction — no clean index futures trade"
+    elif simplified_regime == "ROTATIONAL":
+        tradable     = "PAIR TRADE ONLY"
+        trade_reason = "Rotation active — relative strength plays only, avoid outright index futures"
+    elif alignment == "NOT ALIGNED":
+        tradable     = "WAIT — MISALIGNED"
+        trade_reason = f"{direction} flow but price not confirming — wait for VWAP alignment"
+    else:
+        tradable     = "YES"
+        trade_reason = f"{direction} flow + price aligned | regime: {simplified_regime}"
 
     lines = ["", "FINAL VERDICT"]
-    lines.append(f"Market State: {state_label} | Confidence: {confidence}/100 ({band})")
+    lines.append(
+        f"Regime: {simplified_regime} | Bias Conf: {bias_confidence}/100 | "
+        f"Exec Conf: {execution_confidence}/100 ({exec_band}) | Alignment: {alignment}"
+    )
+    lines.append(f"TRADABLE: {tradable}")
+    lines.append(f"WHY: {trade_reason}")
 
-    # ── WHY (structured bullet list) ──────────────────────────────────────────
-    lines.append("WHY:")
+    # ── Supporting evidence ───────────────────────────────────────────────────
+    lines.append("EVIDENCE:")
 
-    # Flow direction
     if direction == "NEUTRAL":
-        lines.append(f"- Flow is split — no dominant directional bias")
+        lines.append("- Flow is split — no dominant directional bias")
     else:
         dom_pct = bull_pct if direction == "BULLISH" else bear_pct
-        lines.append(f"- {direction} index flow is dominant ({dom_pct}%)")
+        lines.append(f"- {direction} spec flow dominant ({dom_pct}%)")
 
-    # SPY / QQQ / IWM VWAP state
     if rs_data and rs_data.indices.data_ok:
         idx = rs_data.indices
 
@@ -973,37 +1025,26 @@ def _fmt_final_verdict(
         lines.append(f"- {_vwap_state('QQQ', idx.qqq_above_vwap, idx.qqq_pct_vs_vwap)}")
         lines.append(f"- {_vwap_state('IWM', idx.iwm_above_vwap, idx.iwm_pct_vs_vwap)}")
 
-        # Breadth / concentration commentary
-        spy_pct_val = idx.spy_pct_vs_vwap or 0.0
-        qqq_pct_val = idx.qqq_pct_vs_vwap or 0.0
-        iwm_pct_val = idx.iwm_pct_vs_vwap or 0.0
+        spy_pct_val   = idx.spy_pct_vs_vwap or 0.0
+        qqq_pct_val   = idx.qqq_pct_vs_vwap or 0.0
+        iwm_pct_val   = idx.iwm_pct_vs_vwap or 0.0
         tech_vs_broad = qqq_pct_val - spy_pct_val
         tech_vs_small = qqq_pct_val - iwm_pct_val
 
         if tech_vs_small > 0.60:
-            lines.append(
-                f"- Tape is concentrated — tech outpacing small caps by {tech_vs_small:.2f}%"
-            )
+            lines.append(f"- Tape concentrated — tech outpacing small caps by {tech_vs_small:.2f}%")
         elif tech_vs_broad > 0.50:
-            lines.append(
-                f"- Move tilted toward tech — QQQ leading SPY by {tech_vs_broad:.2f}%"
-            )
+            lines.append(f"- Move tilted toward tech — QQQ leading SPY by {tech_vs_broad:.2f}%")
         elif abs(tech_vs_small) < 0.20 and abs(tech_vs_broad) < 0.20:
             lines.append("- Broad participation — tech, large-cap, and small caps moving together")
         else:
             lines.append("- Mixed participation across indices")
 
-    # Leaders / Laggards
-    leaders  = list(dict.fromkeys(
-        getattr(e, "ticker", "") for e in entries_bull[:3] if getattr(e, "ticker", "")
-    ))
-    laggards = list(dict.fromkeys(
-        getattr(e, "ticker", "") for e in entries_bear[:3] if getattr(e, "ticker", "")
-    ))
+    # Use the pre-computed leaders/drags — same values as shown in report header
     if leaders:
-        lines.append(f"- Leading: {', '.join(leaders)}")
-    if laggards:
-        lines.append(f"- Lagging: {', '.join(laggards)}")
+        lines.append(f"- Leaders: {', '.join(leaders)}")
+    if drags:
+        lines.append(f"- Drags: {', '.join(drags)}")
 
     # ── Compact futures summary ───────────────────────────────────────────────
     if rs_data and rs_data.indices.data_ok:
@@ -1012,8 +1053,8 @@ def _fmt_final_verdict(
         def _vp(v: Optional[float]) -> str:
             return f"${v:.2f}" if v is not None else "?"
 
-        nq_act,  _ = _nq_decision(idx, market_state, confidence)
-        es_act,  _ = _es_decision(idx, market_state, confidence)
+        nq_act,  _ = _nq_decision(idx, market_state, execution_confidence)
+        es_act,  _ = _es_decision(idx, market_state, execution_confidence)
         rty_act, _ = _rty_decision(idx, market_state)
         ym_act,  _ = _ym_decision(idx, market_state)
 
@@ -1030,57 +1071,65 @@ def _fmt_final_verdict(
         lines.append(_compact_line("YM",  ym_act,  "SPY", idx.spy_vwap))
 
     # ── DO NOT ────────────────────────────────────────────────────────────────
-    if market_state == "TREND_UP":
-        do_not = "Short into VWAP strength. Chase breakouts without a pullback entry."
-    elif market_state == "TREND_DOWN":
-        do_not = "Buy weakness without a VWAP reclaim. Catch falling knives."
-    elif market_state == "ROTATIONAL":
+    if simplified_regime == "TRENDING":
+        if direction == "BULLISH":
+            do_not = "Short into VWAP strength. Chase breakouts without a pullback entry."
+        else:
+            do_not = "Buy weakness without a VWAP reclaim. Catch falling knives."
+    elif simplified_regime == "ROTATIONAL":
         do_not = "Take outright directional futures positions. Use sector pairs only."
+    elif simplified_regime == "HEDGED":
+        do_not = "Trade directionally into heavy hedge flow — wait for hedge unwind confirmation."
     else:
-        do_not = "Force trades. No edge in CHOP — wait for VWAP alignment across SPY, QQQ, and IWM."
+        do_not = "Force trades. No edge — wait for VWAP alignment across SPY, QQQ, and IWM."
     lines.append(f"DO NOT: {do_not}")
 
     # ── KEY READ ──────────────────────────────────────────────────────────────
     if rs_data and rs_data.indices.data_ok:
         idx = rs_data.indices
-        spy_pct_val = idx.spy_pct_vs_vwap or 0.0
-        qqq_pct_val = idx.qqq_pct_vs_vwap or 0.0
-        iwm_pct_val = idx.iwm_pct_vs_vwap or 0.0
-        tech_vs_small = qqq_pct_val - iwm_pct_val
+        spy_pct_val   = idx.spy_pct_vs_vwap or 0.0
+        qqq_pct_val   = idx.qqq_pct_vs_vwap or 0.0
+        tech_vs_small = qqq_pct_val - (idx.iwm_pct_vs_vwap or 0.0)
 
-        if market_state == "TREND_UP":
-            if tech_vs_small > 0.60:
-                key_read = (
-                    "Tech may bounce, but broad participation is weak — "
-                    "favor NQ longs on VWAP hold, avoid forcing RTY or YM."
-                )
-            elif laggards:
-                key_read = (
-                    f"Bias long NQ and ES while QQQ and SPY hold VWAP. "
-                    f"Watch {laggards[0]} for rotation or reversal signal."
-                )
+        if simplified_regime == "TRENDING":
+            if direction == "BULLISH":
+                if tech_vs_small > 0.60:
+                    key_read = (
+                        "Tech may bounce, but broad participation is weak — "
+                        "favor NQ longs on VWAP hold, avoid forcing RTY or YM."
+                    )
+                elif drags:
+                    key_read = (
+                        f"Bias long NQ and ES while QQQ and SPY hold VWAP. "
+                        f"Watch {drags[0]} for rotation or reversal signal."
+                    )
+                else:
+                    key_read = (
+                        "Broad market aligned — bias long NQ and ES. "
+                        "RTY and YM add if IWM and non-tech breadth hold."
+                    )
             else:
-                key_read = (
-                    "Broad market aligned — bias long NQ and ES. "
-                    "RTY and YM add if IWM and non-tech breadth hold."
-                )
-        elif market_state == "TREND_DOWN":
-            if tech_vs_small < -0.30:
-                key_read = (
-                    "Tech leading lower — NQ short is the primary trade. "
-                    "Confirm RTY and YM independently before adding."
-                )
-            else:
-                key_read = (
-                    "Broad selling pressure is active — fade bounces on NQ and ES. "
-                    "RTY short adds only if IWM confirms VWAP rejection."
-                )
-        elif market_state == "ROTATIONAL":
+                if tech_vs_small < -0.30:
+                    key_read = (
+                        "Tech leading lower — NQ short is the primary trade. "
+                        "Confirm RTY and YM independently before adding."
+                    )
+                else:
+                    key_read = (
+                        "Broad selling pressure is active — fade bounces on NQ and ES. "
+                        "RTY short adds only if IWM confirms VWAP rejection."
+                    )
+        elif simplified_regime == "ROTATIONAL":
             key_read = (
                 "Sector rotation active — avoid index futures, "
-                f"target relative strength plays. "
+                "target relative strength plays. "
                 + (f"Leaders: {', '.join(leaders)}. " if leaders else "")
-                + (f"Fading: {', '.join(laggards)}." if laggards else "")
+                + (f"Fading: {', '.join(drags)}." if drags else "")
+            )
+        elif simplified_regime == "HEDGED":
+            key_read = (
+                "Hedge flow suppressing directional conviction — "
+                "wait for hedge unwind or price confirmation before committing."
             )
         else:
             key_read = (
@@ -1088,12 +1137,15 @@ def _fmt_final_verdict(
                 "Wait for SPY, QQQ, and IWM to align above or below VWAP before committing."
             )
     else:
-        if market_state == "TREND_UP":
-            key_read = "Bias long NQ until QQQ loses VWAP. Confirm breadth with IWM before adding RTY/YM."
-        elif market_state == "TREND_DOWN":
-            key_read = "Selling pressure dominant — fade bounces, protect gains."
-        elif market_state == "ROTATIONAL":
+        if simplified_regime == "TRENDING":
+            if direction == "BULLISH":
+                key_read = "Bias long NQ until QQQ loses VWAP. Confirm breadth with IWM before adding RTY/YM."
+            else:
+                key_read = "Selling pressure dominant — fade bounces, protect gains."
+        elif simplified_regime == "ROTATIONAL":
             key_read = "Sector rotation active — target relative strength, avoid index plays."
+        elif simplified_regime == "HEDGED":
+            key_read = "Hedge flow present — wait for unwind or price confirmation."
         else:
             key_read = "No clear edge — reduce size, wait for index VWAP alignment."
 
@@ -1174,8 +1226,10 @@ def _append_bot_data_block(
     direction: str,
     hedging: bool,
     macro_override: bool,
-    confidence: int,
-    market_state: str,
+    bias_confidence: int,
+    execution_confidence: int,
+    alignment: str,
+    simplified_regime: str,
     primary: str,
     secondary: str,
     leaders: list,
@@ -1194,8 +1248,10 @@ def _append_bot_data_block(
         block = build_bot_data(
             bias=direction,
             hedging=hedging,
-            confidence=confidence,
-            regime_raw=market_state,
+            bias_confidence=bias_confidence,
+            execution_confidence=execution_confidence,
+            alignment=alignment,
+            regime_raw=simplified_regime,
             primary_futures=primary,
             secondary_futures=secondary,
             leaders=list(leaders),
@@ -1221,215 +1277,257 @@ def _append_bot_data_block(
 
 def format_channel_b_report(analysis: dict, rs_data: Optional["MarketRS"] = None) -> str:
     """
-    Build the new Channel B structured output.
+    Build the Channel B structured output.
 
-    Format:
-        🟢/🔴 MARKET BIAS: {bias} WITH {context}
-        Bear {bear%} vs Bull {bull%} | Confidence: {confidence}/100
-
-        Top Overall Flow
-        1. {ticker strike type} | ${premium} IV:{iv}% | Vol/OI {ratio} | Δ {delta} | DTE {dte} | {tag}
-
-        Top Bulls
-        • ...
-
-        Top Bears
-        • ...
-
-        Market Structure
-        • First to pop: ...
-        • Lagging shorts: ...
-        • Likely to catch bid: ...
-
-        Game Plan
-        ▸ Primary: ...
-        ▸ Secondary: ...
-        ▸ Execution: ...
+    All confidence, regime, alignment, leaders, and drags values are computed
+    ONCE here and threaded to every section including BOT_DATA — no section
+    recomputes them independently.
     """
     if not analysis:
         return ""
 
-    direction  = analysis["direction"]       # "BULLISH" | "BEARISH"
-    subtype    = analysis["subtype"]         # "HEDGED" | "POSITIONAL" | "SPECULATIVE"
-    bull_pct   = analysis["bull_pct"]
-    bear_pct   = analysis["bear_pct"]
-    confidence = analysis["confidence"]
-    state      = analysis["state"]
-    mode       = analysis["mode"]
-    entries    = analysis.get("entries", [])
+    direction       = analysis["direction"]
+    subtype         = analysis["subtype"]
+    bull_pct        = analysis["bull_pct"]
+    bear_pct        = analysis["bear_pct"]
+    bias_confidence = analysis["bias_confidence"]
+    state           = analysis["state"]
+    mode            = analysis["mode"]
+    entries         = analysis.get("entries", [])
+    hedging         = analysis.get("hedging", False)
+    # Single source of truth for leaders/drags/mixed
+    leaders         = analysis.get("leaders", [])
+    drags           = analysis.get("drags", [])
+    mixed           = analysis.get("mixed", [])
+    hedge_entries   = analysis.get("hedge_entries", [])
+    spec_entries    = analysis.get("spec_entries", entries)
+    spec_bull_pct   = analysis.get("spec_bull_pct", bull_pct)
+    spec_bear_pct   = analysis.get("spec_bear_pct", bear_pct)
 
-    # ── Bias line ─────────────────────────────────────────────────────────────
+    # ── Compute execution_confidence ONCE ────────────────────────────────────
     _LOW_CONFIDENCE = 20
-    effective_direction = "NEUTRAL" if confidence < _LOW_CONFIDENCE else direction
+    effective_direction = "NEUTRAL" if bias_confidence < _LOW_CONFIDENCE else direction
+    execution_confidence = (
+        _compute_structured_confidence(effective_direction, bull_pct, bear_pct, rs_data, entries)
+        if rs_data and rs_data.data_ok
+        else bias_confidence
+    )
+
+    # ── Regime + alignment computed ONCE ─────────────────────────────────────
+    ms             = rs_data.market_state if (rs_data and rs_data.data_ok) else "NO_DATA"
+    regime_indices = rs_data.indices      if (rs_data and rs_data.data_ok) else None
+    detailed_tag   = _derive_regime_tag(effective_direction, execution_confidence, ms, regime_indices)
+    simp_regime    = _simplified_regime(detailed_tag, hedging)
+    alignment      = _compute_alignment(effective_direction, regime_indices)
+
+    # ── Bias header ──────────────────────────────────────────────────────────
     if effective_direction == "BULLISH":
         bias_emoji = "🟢"
     elif effective_direction == "BEARISH":
         bias_emoji = "🔴"
     else:
         bias_emoji = "⚪"
-    context    = f"{subtype} | {state}"
-    conf_note  = " ⚠️ LOW CONFIDENCE" if confidence < _LOW_CONFIDENCE else ""
+
+    conf_note = " ⚠️ LOW CONFIDENCE" if bias_confidence < _LOW_CONFIDENCE else ""
     lines = [
-        f"{bias_emoji} MARKET BIAS: {effective_direction} WITH {context}{conf_note}",
-        f"Bear {bear_pct}% vs Bull {bull_pct}% | Confidence: {confidence}/100",
+        f"{bias_emoji} MARKET BIAS: {effective_direction}{conf_note}",
+        f"BIAS CONFIDENCE: {bias_confidence}/100 | EXECUTION CONFIDENCE: {execution_confidence}/100",
+        f"REGIME: {simp_regime} | ALIGNMENT: {alignment}",
         "",
     ]
 
-    # ── Top Overall Flow (top 5 by priority, then score) ─────────────────────
+    # ── Leaders / Drags / Mixed ───────────────────────────────────────────────
+    lines.append(f"LEADERS: {', '.join(leaders) if leaders else 'None'}")
+    lines.append(f"DRAGS:   {', '.join(drags)   if drags   else 'None'}")
+    if mixed:
+        lines.append(f"MIXED:   {', '.join(mixed)} (flow on both sides)")
+    lines.append("")
+
+    # ── Flow Summary ─────────────────────────────────────────────────────────
+    spec_count  = len(spec_entries)
+    hedge_count = len(hedge_entries)
+    lines.append("FLOW SUMMARY:")
+    lines.append(
+        f"- SPEC FLOW:  {spec_count} signal(s) | "
+        f"{spec_bull_pct}% call / {spec_bear_pct}% put"
+    )
+    if hedge_count:
+        hedge_tickers = list(dict.fromkeys(e.ticker for e in hedge_entries))
+        lines.append(
+            f"- HEDGE FLOW: {hedge_count} signal(s) — "
+            f"{', '.join(hedge_tickers[:4])} "
+            f"(suppresses execution confidence)"
+        )
+    else:
+        lines.append("- HEDGE FLOW: none detected")
+    lines.append("")
+
+    # ── Price Context ─────────────────────────────────────────────────────────
+    if regime_indices and regime_indices.data_ok:
+        idx = regime_indices
+        def _vwap_line(name, price, vwap, above, pct):
+            if price is None:
+                return f"- {name}: no data"
+            pos  = "ABOVE" if above else "BELOW"
+            pstr = f" ({pct:+.2f}%)" if pct is not None else ""
+            return f"- {name}: ${price:.2f} — {pos} VWAP (${vwap:.2f}){pstr}" if vwap else f"- {name}: ${price:.2f} — VWAP N/A"
+        lines.append("PRICE CONTEXT:")
+        lines.append(_vwap_line("SPY", idx.spy_price, idx.spy_vwap, idx.spy_above_vwap, idx.spy_pct_vs_vwap))
+        lines.append(_vwap_line("QQQ", idx.qqq_price, idx.qqq_vwap, idx.qqq_above_vwap, idx.qqq_pct_vs_vwap))
+        lines.append(_vwap_line("IWM", idx.iwm_price, idx.iwm_vwap, idx.iwm_above_vwap, idx.iwm_pct_vs_vwap))
+        lines.append("")
+
+    # ── Top Overall Flow ──────────────────────────────────────────────────────
     actionable = [e for e in entries if e.decision != "KILL"]
-    top_all = sorted(actionable, key=lambda e: (e.priority, -e.score))[:5]
+    top_all    = sorted(actionable, key=lambda e: (e.priority, -e.score))[:5]
 
     if top_all:
-        lines.append("Top Overall Flow")
+        lines.append("TOP FLOW")
         for i, e in enumerate(top_all, 1):
-            tag = _tag_for(e)
+            tag       = _tag_for(e)
             delta_str = f"{e.delta:+.2f}" if e.delta else "N/A"
             lines.append(
                 f"{i}. {e.ticker} ${e.strike:.0f}{e.side[0]} "
                 f"| {_fmt_p(e.premium_usd)} IV:{e.iv_pct:.1f}% "
                 f"| Vol/OI {e.vol_oi_ratio:.1f}x "
-                f"| Δ {delta_str} "
-                f"| DTE {e.dte} "
-                f"| {tag}"
+                f"| Δ {delta_str} | DTE {e.dte} | {tag}"
             )
         lines.append("")
 
-    # ── Top Bulls ─────────────────────────────────────────────────────────────
-    bulls = sorted(
-        [e for e in actionable if e.side == "CALL"],
-        key=lambda e: (e.priority, -e.score),
-    )[:3]
+    # ── Top Bulls (SPEC CALL flow only — label as leaders if applicable) ──────
+    bulls = sorted([e for e in actionable if e.side == "CALL"], key=lambda e: (e.priority, -e.score))[:3]
     if bulls:
-        lines.append("Top Bulls")
+        lines.append("TOP BULLS")
         for e in bulls:
-            delta_str = f"{e.delta:+.2f}" if e.delta else "N/A"
+            delta_str  = f"{e.delta:+.2f}" if e.delta else "N/A"
+            leader_tag = " ★" if e.ticker in leaders else ""
             lines.append(
-                f"• {e.ticker} ${e.strike:.0f}C "
+                f"• {e.ticker}{leader_tag} ${e.strike:.0f}C "
                 f"| {_fmt_p(e.premium_usd)} IV:{e.iv_pct:.1f}% "
                 f"| Vol/OI {e.vol_oi_ratio:.1f}x "
                 f"| Δ {delta_str} | DTE {e.dte}"
             )
         lines.append("")
 
-    # ── Top Bears ─────────────────────────────────────────────────────────────
-    bears = sorted(
-        [e for e in actionable if e.side == "PUT"],
-        key=lambda e: (e.priority, -e.score),
-    )[:3]
+    # ── Top Bears (SPEC PUT flow only — label as drags if applicable) ─────────
+    bears = sorted([e for e in actionable if e.side == "PUT"], key=lambda e: (e.priority, -e.score))[:3]
     if bears:
-        lines.append("Top Bears")
+        lines.append("TOP BEARS")
         for e in bears:
             delta_str = f"{e.delta:+.2f}" if e.delta else "N/A"
+            drag_tag  = " ★" if e.ticker in drags else ""
             lines.append(
-                f"• {e.ticker} ${e.strike:.0f}P "
+                f"• {e.ticker}{drag_tag} ${e.strike:.0f}P "
                 f"| {_fmt_p(e.premium_usd)} IV:{e.iv_pct:.1f}% "
                 f"| Vol/OI {e.vol_oi_ratio:.1f}x "
                 f"| Δ {delta_str} | DTE {e.dte}"
             )
         lines.append("")
 
-    # ── Market Structure ──────────────────────────────────────────────────────
-    lines.append("Market Structure")
-
-    # First to pop: highest-priority bull
-    first_pop = bulls[0].ticker if bulls else (bears[0].ticker if bears else "N/A")
-    lines.append(f"• First to pop: {first_pop}")
-
-    # Lagging shorts: bears with higher DTE (positional hedges)
-    lagging = [e.ticker for e in bears if e.dte >= 7][:2]
-    lines.append(f"• Lagging shorts: {', '.join(lagging) if lagging else 'None'}")
-
-    # Likely to catch bid: speculative calls
-    spec_tickers = [
-        e.ticker for e in actionable
-        if e.side == "CALL" and e.classification in ("SPECULATIVE_DIRECTIONAL", "CONTINUATION_STRONG")
-    ][:2]
-    lines.append(f"• Likely to catch bid: {', '.join(spec_tickers) if spec_tickers else 'N/A'}")
-    lines.append("")
-
     # ── Game Plan ─────────────────────────────────────────────────────────────
-    lines.append("Game Plan")
-
-    if mode == "BULLISH":
-        primary   = "Buy dips into VWAP on leading names"
-        secondary = "Avoid shorts — trend favors longs"
-        execution = "Scale in on first 15m confirmation, stop below PM low"
+    lines.append("GAME PLAN")
+    if simp_regime == "HEDGED":
+        gp_primary   = "Hedge or wait — do not force directional index trades"
+        gp_secondary = "Watch for hedge unwind signal before committing"
+        gp_execution = "No new index futures positions until alignment confirmed"
+    elif simp_regime == "ROTATIONAL":
+        s_strong = analysis.get("sectors_strong", [])
+        s_weak   = analysis.get("sectors_weak", [])
+        gp_primary   = f"Long {s_strong[0] if s_strong else 'strong sector'}"
+        gp_secondary = f"Short {s_weak[0] if s_weak else 'weak sector'}"
+        gp_execution = "Pair trade — size small, wide stops, fade extremes"
+    elif simp_regime == "CHOP":
+        gp_primary   = "Stand aside — no edge"
+        gp_secondary = "Wait for SPY/QQQ/IWM VWAP alignment"
+        gp_execution = "Do not force trades"
+    elif mode == "BULLISH":
+        gp_primary   = "Buy dips into VWAP on leading names"
+        gp_secondary = "Avoid shorts — trend favors longs"
+        gp_execution = "Scale in on first 15m confirmation, stop below PM low"
     elif mode == "BEARISH":
-        primary   = "Fade bounces into resistance on weak names"
-        secondary = "Hedge core longs with index puts"
-        execution = "Enter on failed bounce candle, stop above PM high"
-    else:  # CHOP / PAIR TRADE
-        primary   = f"Long {analysis.get('sectors_strong', ['N/A'])[0] if analysis.get('sectors_strong') else 'N/A'}"
-        secondary = f"Short {analysis.get('sectors_weak', ['N/A'])[0] if analysis.get('sectors_weak') else 'N/A'}"
-        execution = "Pair trade — size small, wide stops, fade extremes"
+        gp_primary   = "Fade bounces into resistance on weak names"
+        gp_secondary = "Hedge core longs with index puts"
+        gp_execution = "Enter on failed bounce candle, stop above PM high"
+    else:
+        gp_primary   = "Reduce size"
+        gp_secondary = "Wait for alignment"
+        gp_execution = "No conviction trade"
 
-    lines.append(f"▸ Primary: {primary}")
-    lines.append(f"▸ Secondary: {secondary}")
-    lines.append(f"▸ Execution: {execution}")
+    lines.append(f"▸ Primary:   {gp_primary}")
+    lines.append(f"▸ Secondary: {gp_secondary}")
+    lines.append(f"▸ Execution: {gp_execution}")
 
     # ── Top Actionable Contracts ──────────────────────────────────────────────
-    actionable_section = _fmt_actionable_section(entries, direction)
+    actionable_section = _fmt_actionable_section(entries, effective_direction)
     if actionable_section:
         lines.append(actionable_section)
 
-    # ── Market Regime Tag (with change detection + persistence) ──────────────
-    ms             = rs_data.market_state if (rs_data and rs_data.data_ok) else "NO_DATA"
-    regime_indices = rs_data.indices      if (rs_data and rs_data.data_ok) else None
+    # ── Regime block (with change detection) ─────────────────────────────────
     lines.append("")
-    lines.append(_fmt_regime_block(effective_direction, confidence, ms, regime_indices))
+    lines.append(_fmt_regime_block(effective_direction, execution_confidence, ms, regime_indices))
 
-    # ── Driver List ───────────────────────────────────────────────────────────
-    bulls_list = sorted([e for e in actionable if e.side == "CALL"], key=lambda e: e.priority)
-    bears_list = sorted([e for e in actionable if e.side == "PUT"],  key=lambda e: e.priority)
-    driver_block = _fmt_driver_list(bulls_list, bears_list, rs_data)
-    if driver_block:
-        lines.append(driver_block)
-
-    # ── Execution Plan (RS-powered) ───────────────────────────────────────────
+    # ── Execution Plan ────────────────────────────────────────────────────────
     if rs_data and rs_data.data_ok:
         exec_plan = _fmt_execution_plan(
             rs_data.market_state, rs_data.indices,
-            direction=effective_direction, confidence=confidence,
+            direction=effective_direction, confidence=execution_confidence,
         )
         if exec_plan:
             lines.append(exec_plan)
-        conviction = _fmt_conviction_rank(
+        conviction_block = _fmt_conviction_rank(
             rs_data.market_state, rs_data.indices,
-            effective_direction, confidence, rs_data,
+            effective_direction, execution_confidence, rs_data,
         )
-        if conviction:
-            lines.append(conviction)
+        if conviction_block:
+            lines.append(conviction_block)
 
-    # ── Final Verdict ─────────────────────────────────────────────────────────
+    # ── Final Verdict — uses the same pre-computed values, no recompute ───────
+    bulls_list = sorted([e for e in actionable if e.side == "CALL"], key=lambda e: e.priority)
+    bears_list = sorted([e for e in actionable if e.side == "PUT"],  key=lambda e: e.priority)
     lines.append(_fmt_final_verdict(
-        ms, effective_direction, confidence, rs_data,
-        bull_pct, bear_pct, actionable, bulls_list, bears_list,
+        ms,
+        effective_direction,
+        bias_confidence,
+        execution_confidence,
+        simp_regime,
+        alignment,
+        rs_data,
+        bull_pct,
+        bear_pct,
+        actionable,
+        leaders,
+        drags,
     ))
 
     human_text = "\n".join(lines)
 
-    # ── BOT_DATA block (machine-readable) ─────────────────────────────────────
-    session = current_session()
-    dq_base = baseline_data_quality(session)
-    alpaca_ok  = bool(rs_data and rs_data.data_ok)
+    # ── BOT_DATA block — identical values, zero drift ─────────────────────────
+    session      = current_session()
+    dq_base      = baseline_data_quality(session)
+    alpaca_ok    = bool(rs_data and rs_data.data_ok)
     data_quality = degrade_data_quality(dq_base, alpaca_ok=alpaca_ok, tradier_ok=True)
 
     primary, secondary = _get_primary_secondary_futures(
-        ms, rs_data.indices if (rs_data and rs_data.data_ok) else None,
-        effective_direction, confidence, rs_data,
+        ms,
+        rs_data.indices if (rs_data and rs_data.data_ok) else None,
+        effective_direction,
+        execution_confidence,
+        rs_data,
     )
 
     return _append_bot_data_block(
         human_text,
         direction=effective_direction,
-        hedging=analysis.get("hedging", False),
+        hedging=hedging,
         macro_override=analysis.get("macro_override", False),
-        confidence=confidence,
-        market_state=ms,
+        bias_confidence=bias_confidence,
+        execution_confidence=execution_confidence,
+        alignment=alignment,
+        simplified_regime=simp_regime,
         primary=primary,
         secondary=secondary,
-        leaders=analysis.get("leaders", []),
-        drags=analysis.get("drags", []),
+        leaders=leaders,
+        drags=drags,
         session=session,
         data_quality=data_quality,
         rs_data=rs_data,
@@ -1503,14 +1601,18 @@ def format_premarket_report(
     # ── BOT_DATA block (premarket — DATA_QUALITY always MEDIUM or LOW) ────────
     session      = current_session()
     data_quality = degrade_data_quality("MEDIUM", alpaca_ok=True, tradier_ok=False)
+    bias_confidence = confidence
+    execution_confidence = min(100, max(0, confidence - 10))
 
     return _append_bot_data_block(
         human_text,
         direction=direction,
         hedging=analysis.get("hedging", False) if analysis else False,
         macro_override=analysis.get("macro_override", False) if analysis else False,
-        confidence=confidence,
-        market_state="NO_DATA",
+        bias_confidence=bias_confidence,
+        execution_confidence=execution_confidence,
+        alignment="UNKNOWN",
+        simplified_regime="CHOP",
         primary="NONE",
         secondary="NONE",
         leaders=analysis.get("leaders", []) if analysis else [],
@@ -1784,33 +1886,13 @@ def format_aggregated_report_b(report, rs_data: Optional["MarketRS"] = None) -> 
         if conviction:
             lines.append(conviction)
 
-    # ── Final Verdict ─────────────────────────────────────────────────────────
-    lines.append(_fmt_final_verdict(
-        ms,
-        effective_direction,
-        report.confidence,
-        rs_data,
-        report.bull_pct,
-        report.bear_pct,
-        all_entries,
-        report.top_bulls,
-        report.top_bears,
-    ))
-
-    human_text = "\n".join(lines)
-
-    # ── BOT_DATA block (machine-readable) ─────────────────────────────────────
-    session = current_session()
-    dq_base = baseline_data_quality(session)
-    alpaca_ok  = bool(rs_data and rs_data.data_ok)
-    data_quality = degrade_data_quality(dq_base, alpaca_ok=alpaca_ok, tradier_ok=True)
-
-    primary, secondary = _get_primary_secondary_futures(
-        ms,
-        rs_data.indices if (rs_data and rs_data.data_ok) else None,
-        effective_direction,
-        report.confidence,
-        rs_data,
+    # ── Compute values for Final Verdict + BOT_DATA ───────────────────────────
+    bias_confidence      = report.confidence
+    indices              = rs_data.indices if (rs_data and rs_data.data_ok) else None
+    alignment            = _compute_alignment(effective_direction, indices)
+    simp_regime          = _simplified_regime(ms, hedging=False)
+    execution_confidence = _compute_structured_confidence(
+        effective_direction, report.bull_pct, report.bear_pct, rs_data, all_entries
     )
 
     # Extract leaders/drags from parsed flow entries
@@ -1825,13 +1907,47 @@ def format_aggregated_report_b(report, rs_data: Optional["MarketRS"] = None) -> 
         if getattr(e, "side", "") == _opposed
     ))[:5]
 
+    # ── Final Verdict ─────────────────────────────────────────────────────────
+    lines.append(_fmt_final_verdict(
+        ms,
+        effective_direction,
+        bias_confidence,
+        execution_confidence,
+        simp_regime,
+        alignment,
+        rs_data,
+        report.bull_pct,
+        report.bear_pct,
+        all_entries,
+        leaders,
+        drags,
+    ))
+
+    human_text = "\n".join(lines)
+
+    # ── BOT_DATA block (machine-readable) ─────────────────────────────────────
+    session = current_session()
+    dq_base = baseline_data_quality(session)
+    alpaca_ok  = bool(rs_data and rs_data.data_ok)
+    data_quality = degrade_data_quality(dq_base, alpaca_ok=alpaca_ok, tradier_ok=True)
+
+    primary, secondary = _get_primary_secondary_futures(
+        ms,
+        indices,
+        effective_direction,
+        bias_confidence,
+        rs_data,
+    )
+
     return _append_bot_data_block(
         human_text,
         direction=effective_direction,
         hedging=False,   # IntelReport doesn't track hedging — safe default
         macro_override=False,
-        confidence=report.confidence,
-        market_state=ms,
+        bias_confidence=bias_confidence,
+        execution_confidence=execution_confidence,
+        alignment=alignment,
+        simplified_regime=simp_regime,
         primary=primary,
         secondary=secondary,
         leaders=leaders,

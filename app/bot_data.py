@@ -66,13 +66,17 @@ _REGIME_MAP: dict[str, str] = {
     "DEFENSIVE RISK-OFF":    "RISK_OFF",
     "ROTATIONAL CHOP":       "ROTATIONAL",
     "MIXED / UNTRADEABLE":   "MIXED",
+    # Simplified regime labels from _simplified_regime()
+    "TRENDING":              "TRENDING",
+    "ROTATIONAL":            "ROTATIONAL",
+    "HEDGED":                "HEDGED",
+    "CHOP":                  "CHOP",
     # Already-normalized values pass through
     "TREND_UP":              "TREND_UP",
     "TREND_UP_TECH":         "TREND_UP_TECH",
     "TREND_DOWN":            "TREND_DOWN",
     "TREND_DOWN_TECH":       "TREND_DOWN_TECH",
     "RISK_OFF":              "RISK_OFF",
-    "ROTATIONAL":            "ROTATIONAL",
     "MIXED":                 "MIXED",
     "NO_DATA":               "NO_DATA",
 }
@@ -90,7 +94,9 @@ class BotDataBlock:
     bias: str                          # BULLISH | BEARISH | NEUTRAL
     hedging: bool                      # True = hedge flow detected in batch
     macro_override: bool               # True = macro/index flow overrides ticker flow
-    confidence: int                    # 0–100, single value only
+    bias_confidence: int               # 0–100, spec-flow directional strength
+    execution_confidence: int          # 0–100, tradability (price + flow alignment)
+    alignment: str                     # ALIGNED | NOT ALIGNED | UNKNOWN
 
     # ── Regime + futures ───────────────────────────────────────────────────────
     regime: str                        # normalized regime key
@@ -159,6 +165,7 @@ def _derive_playbook(
     session: str,
     data_quality: str,
     leaders: list[str],
+    execution_confidence: int = 50,
 ) -> str:
     if data_quality == "LOW":
         return PLAYBOOK_NO_TRADE
@@ -168,8 +175,14 @@ def _derive_playbook(
         return PLAYBOOK_AFTER_HOURS_WATCH
     if session == "CLOSED":
         return PLAYBOOK_NO_TRADE
-    if regime in ("MIXED", "NO_DATA"):
+    if execution_confidence < 25:
+        return PLAYBOOK_NO_TRADE
+    if regime in ("MIXED", "NO_DATA", "CHOP"):
         return PLAYBOOK_WAIT
+    if regime == "HEDGED":
+        return PLAYBOOK_WAIT
+    if regime == "ROTATIONAL":
+        return PLAYBOOK_PAIR_TRADE
     if bias == "BULLISH":
         tech_tickers = {"QQQ", "XLK", "NVDA", "AMD", "MSFT", "AAPL", "META", "GOOGL"}
         has_tech_leaders = bool(set(leaders) & tech_tickers)
@@ -187,7 +200,9 @@ def build_bot_data(
     *,
     bias: str,
     hedging: bool,
-    confidence: int,
+    bias_confidence: int,
+    execution_confidence: int,
+    alignment: str = "UNKNOWN",
     regime_raw: str,
     primary_futures: str,
     secondary_futures: str,
@@ -225,13 +240,16 @@ def build_bot_data(
         session=session,
         data_quality=data_quality,
         leaders=leaders,
+        execution_confidence=execution_confidence,
     )
 
     return BotDataBlock(
         bias=bias.upper(),
         hedging=hedging,
         macro_override=macro_override,
-        confidence=max(0, min(100, confidence)),
+        bias_confidence=max(0, min(100, bias_confidence)),
+        execution_confidence=max(0, min(100, execution_confidence)),
+        alignment=alignment.upper(),
         regime=regime,
         primary=primary_futures.upper() if primary_futures else "NONE",
         secondary=secondary_futures.upper() if secondary_futures else "NONE",
@@ -277,7 +295,9 @@ def render_bot_data(block: BotDataBlock) -> str:
         f"BIAS={block.bias}",
         f"HEDGING={_fmt_bool(block.hedging)}",
         f"MACRO_OVERRIDE={_fmt_bool(block.macro_override)}",
-        f"CONFIDENCE={block.confidence}",
+        f"BIAS_CONFIDENCE={block.bias_confidence}",
+        f"EXECUTION_CONFIDENCE={block.execution_confidence}",
+        f"ALIGNMENT={block.alignment}",
         f"REGIME={block.regime}",
         f"PRIMARY={block.primary}",
         f"SECONDARY={block.secondary}",
@@ -300,7 +320,12 @@ def render_bot_data(block: BotDataBlock) -> str:
 
 def query_bias(block: BotDataBlock) -> str:
     hedging_note = " (with active hedging)" if block.hedging else ""
-    return f"BIAS: {block.bias}{hedging_note} | Confidence: {block.confidence}%"
+    return (
+        f"BIAS: {block.bias}{hedging_note} | "
+        f"Bias Conf: {block.bias_confidence}% | "
+        f"Exec Conf: {block.execution_confidence}% | "
+        f"Alignment: {block.alignment}"
+    )
 
 
 def query_leaders(block: BotDataBlock) -> str:
