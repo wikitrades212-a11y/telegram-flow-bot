@@ -426,6 +426,42 @@ class PremarketTracker:
         return notes
 
 
+# ── Auto-pick: fetch best contract from dashboard picker ─────────────────────
+
+async def _auto_pick(ticker: str, direction: str) -> str | None:
+    """
+    Call the local dashboard's /api/pick and return a compact Telegram-ready
+    string summarising the top contract, or None if unavailable.
+    """
+    base = (config.DASHBOARD_INGEST_URL or "").rsplit("/api/", 1)[0]
+    if not base:
+        return None
+    try:
+        import httpx
+        r = await httpx.AsyncClient(timeout=10.0).post(
+            f"{base}/api/pick",
+            json={"ticker": ticker, "direction": direction, "profile": "balanced"},
+        )
+        if r.status_code != 200:
+            return None
+        d = r.json()
+        if not d.get("candidates"):
+            return None
+        top = d["candidates"][0]
+        c   = top["contract"]
+        exp = (c.get("expiration") or "")[-5:].replace("-", "/")
+        prem = c.get("premium_at_signal") or c.get("mid")
+        prem_str = f"${prem:.2f}/ct (${prem*100:.0f}/ct)" if prem else "N/A"
+        return (
+            f"\n📌 Best contract: {c['ticker']} {c['strike']:.0f}"
+            f"{'C' if c['option_type']=='call' else 'P'} {exp}"
+            f" | Score {top['score']:.0f} | Δ{c.get('delta',0):.2f}"
+            f" | {prem_str}"
+        )
+    except Exception:
+        return None
+
+
 # ── Price check task ──────────────────────────────────────────────────────────
 
 async def _price_check_task(
@@ -1306,7 +1342,10 @@ async def main() -> None:
                 record_signal(sig, decision.price, state="GO", classification=cls)
                 update_signal_go(sig.signal_id, decision.price, datetime.utcnow().isoformat())
                 asyncio.create_task(_price_check_task(sig.signal_id, sig.ticker, sig.side, market))
-                await post_to_b(format_go(sig, decision), label="GO")
+                direction  = "BULLISH" if sig.side == "CALL" else "BEARISH"
+                go_text    = format_go(sig, decision)
+                pick_line  = await _auto_pick(sig.ticker, direction)
+                await post_to_b(go_text + (pick_line or ""), label="GO")
                 mark_sent(sig.signal_id, "GO")
 
         elif decision.verdict == "HOLD":
