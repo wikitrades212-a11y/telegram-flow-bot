@@ -19,6 +19,7 @@ Flow:
 import asyncio
 import hashlib
 import logging
+import os
 import re
 import signal
 import sys
@@ -67,6 +68,7 @@ from app.storage import (
     init_db, was_sent, mark_sent,
     record_signal, update_signal_go, update_price_check,
     get_signal_entry, update_outcome, get_stats_summary,
+    record_event,
 )
 from app.backup import restore_db, backup_db, backup_loop
 from app.tradier import fetch_option_quote
@@ -177,6 +179,45 @@ def _setup_logging() -> None:
 
 logger = logging.getLogger(__name__)
 _INSTANCE_ID = uuid.uuid4().hex[:8]
+
+# ── HTTP command server ────────────────────────────────────────────────────────
+# Populated inside main() once closures over sig_window / market are ready.
+_CMD: dict = {}
+
+try:
+    from fastapi import FastAPI as _FA, Header as _FH, HTTPException as _FE
+    import uvicorn as _UV
+
+    _http_app = _FA(docs_url=None, redoc_url=None)
+
+    @_http_app.get("/health")
+    def _http_health():
+        return {"ok": True, "service": "sz-flow-bot"}
+
+    @_http_app.get("/commands")
+    def _http_list():
+        return {"commands": sorted(_CMD)}
+
+    @_http_app.get("/command/{cmd}")
+    async def _http_cmd(cmd: str, x_token: str = _FH(default="")):
+        if config.COMMAND_TOKEN and x_token != config.COMMAND_TOKEN:
+            raise _FE(status_code=401, detail="Unauthorized")
+        fn = _CMD.get(cmd)
+        if fn is None:
+            raise _FE(status_code=404, detail=f"Unknown command: {cmd}")
+        try:
+            text = await fn()
+            return {"ok": True, "text": text, "cmd": cmd}
+        except Exception as exc:
+            logger.error("HTTP command %s failed: %s", cmd, exc, exc_info=True)
+            raise _FE(status_code=500, detail=str(exc))
+
+    _HTTP_OK = True
+    logger.info("HTTP command server ready (fastapi+uvicorn found)")
+except ImportError:
+    _http_app = None
+    _HTTP_OK  = False
+    logger.warning("fastapi/uvicorn not installed — HTTP command server disabled")
 _ET = _pytz.timezone("America/New_York")
 
 
@@ -470,6 +511,7 @@ async def main() -> None:
                 text=text,
             )
             dedup.record(text, label)
+            record_event("CHANNEL_B", text, label=label or None)
             logger.info(
                 "Channel B send OK | tg_msg_id=%d | label=%s",
                 sent.message_id, label or "?",
@@ -504,6 +546,7 @@ async def main() -> None:
                 chat_id=config.INTEL_CHANNEL,
                 text=text,
             )
+            record_event("CHANNEL_A", text, signal_id=signal_id or None)
         except Exception as exc:
             logger.warning(
                 "Channel A (intel) send FAILED | chat_id=%s | signal=%s | error: %s",
@@ -982,6 +1025,102 @@ async def main() -> None:
             logger.error("/debug failed: %s", exc, exc_info=True)
             await update.message.reply_text(f"Debug failed: {exc}")
 
+    # ── HTTP command helpers — return formatted text, no Telegram send ────────
+
+    async def _run_report_text() -> str:
+        entries = sig_window.fresh()
+        if entries:
+            analysis = _analyze(entries)
+            tickers  = list(dict.fromkeys(e.ticker for e in entries))[:5]
+            rs_data  = await compute_rs(market, analysis.get("direction","NEUTRAL"), analysis.get("confidence",0), tickers)
+            report   = format_channel_b_report(analysis, rs_data=rs_data)
+        else:
+            rs_data = await compute_rs(market, "NEUTRAL", 0, [])
+            report  = ""
+        if not report:
+            from datetime import time as _dtime
+            now = _now_et(); t, wd = now.time(), now.weekday()
+            session = ("CLOSED" if wd >= 5 or t < _dtime(7,0) or t > _dtime(20,0)
+                       else "PREMARKET" if t < _dtime(9,30)
+                       else "MARKET" if t < _dtime(16,0) else "AFTER HOURS")
+            sched   = _scheduler_ref[0] if _scheduler_ref else None
+            ctx     = sched.context if sched else None
+            report  = format_no_flow_snapshot(
+                session_label=session, time_str=now.strftime("%H:%M"),
+                rs_data=rs_data,
+                prior_direction=ctx.direction if ctx else "NEUTRAL",
+                prior_leaders=ctx.leaders   if ctx else [],
+                prior_laggards=ctx.laggards if ctx else [],
+            )
+        return report
+
+    async def _run_premarket_text() -> str:
+        analysis = pm_tracker.peek()
+        notes    = pm_tracker.overnight_notes()
+        return format_premarket_report(analysis, overnight_notes=notes)
+
+    async def _run_flow_text() -> str:
+        return format_flow_summary(sig_window.fresh())
+
+    async def _run_bias_text() -> str:
+        entries  = sig_window.fresh()
+        analysis = _analyze(entries) if entries else {}
+        tickers  = list(dict.fromkeys(e.ticker for e in entries))[:5] if entries else []
+        rs_data  = await compute_rs(market, analysis.get("direction","NEUTRAL"), analysis.get("confidence",0), tickers)
+        return format_bias_only(analysis, rs_data=rs_data)
+
+    async def _run_options_text() -> str:
+        entries, direction, _ = await _fresh_entries_and_direction()
+        return format_hot_options(entries, filter_fn=None, label="HOT OPTIONS", direction=direction, max_per_ticker=2)
+
+    async def _run_bulls_text() -> str:
+        entries, direction, _ = await _fresh_entries_and_direction()
+        return format_hot_options(entries, filter_fn=lambda e: getattr(e,"side","")=="CALL", label="HOT OPTIONS — BULLS", direction=direction, max_per_ticker=1)
+
+    async def _run_bears_text() -> str:
+        entries, direction, _ = await _fresh_entries_and_direction()
+        return format_hot_options(entries, filter_fn=lambda e: getattr(e,"side","")=="PUT", label="HOT OPTIONS — BEARS", direction=direction, max_per_ticker=1)
+
+    async def _run_tech_text() -> str:
+        entries, direction, _ = await _fresh_entries_and_direction()
+        return format_hot_options(entries, filter_fn=lambda e: getattr(e,"ticker","") in _TECH_TICKERS, label="HOT OPTIONS — TECH", direction=direction, max_per_ticker=1)
+
+    async def _run_techbulls_text() -> str:
+        entries, direction, _ = await _fresh_entries_and_direction()
+        return format_hot_options(entries, filter_fn=lambda e: getattr(e,"ticker","") in _TECH_TICKERS and getattr(e,"side","")=="CALL", label="HOT OPTIONS — TECH BULLS", direction=direction, max_per_ticker=1)
+
+    async def _run_techbears_text() -> str:
+        entries, direction, _ = await _fresh_entries_and_direction()
+        return format_hot_options(entries, filter_fn=lambda e: getattr(e,"ticker","") in _TECH_TICKERS and getattr(e,"side","")=="PUT", label="HOT OPTIONS — TECH BEARS", direction=direction, max_per_ticker=1)
+
+    async def _run_hedges_text() -> str:
+        entries, direction, _ = await _fresh_entries_and_direction()
+        return format_hot_options(entries, filter_fn=lambda e: getattr(e,"ticker","") in _INDEX_HEDGE_TICKERS and getattr(e,"side","")=="PUT", label="INDEX HEDGES", direction=direction, max_per_ticker=1)
+
+    async def _run_future_text(future: str) -> str:
+        entries  = sig_window.fresh()
+        analysis = _analyze(entries) if entries else {}
+        rs_data  = await compute_rs(market, analysis.get("direction","NEUTRAL"), analysis.get("confidence",0), [])
+        return format_single_future_plan(future, rs_data, analysis.get("direction","NEUTRAL"), analysis.get("confidence",0))
+
+    _CMD.update({
+        "report":    _run_report_text,
+        "premarket": _run_premarket_text,
+        "flow":      _run_flow_text,
+        "bias":      _run_bias_text,
+        "options":   _run_options_text,
+        "bulls":     _run_bulls_text,
+        "bears":     _run_bears_text,
+        "tech":      _run_tech_text,
+        "techbulls": _run_techbulls_text,
+        "techbears": _run_techbears_text,
+        "hedges":    _run_hedges_text,
+        "nq":  lambda: _run_future_text("NQ"),
+        "es":  lambda: _run_future_text("ES"),
+        "rty": lambda: _run_future_text("RTY"),
+        "ym":  lambda: _run_future_text("YM"),
+    })
+
     # ── Register manual command handlers ──────────────────────────────────────
 
     for _cmd, _fn in [
@@ -1264,10 +1403,20 @@ async def main() -> None:
             backup_loop(application.bot, config.BACKUP_CHAT_ID, config.DB_PATH)
         )
 
+        _uv_srv = None
+        if _HTTP_OK:
+            _port   = int(os.environ.get("PORT", 8080))
+            _uv_cfg = _UV.Config(_http_app, host="0.0.0.0", port=_port, log_level="warning")
+            _uv_srv = _UV.Server(_uv_cfg)
+            asyncio.create_task(_uv_srv.serve())
+            logger.info("HTTP command server listening on port %d", _port)
+
         await stop_event.wait()
 
         logger.info("Shutdown signal received")
         watcher.stop()
+        if _uv_srv:
+            _uv_srv.should_exit = True
         for task in (watcher_task, pm_task, scheduler_task, backup_task):
             task.cancel()
             try:

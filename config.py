@@ -79,6 +79,10 @@ DASHBOARD_INGEST_URL: str = os.environ.get("DASHBOARD_INGEST_URL", "")
 # ── Tradier ───────────────────────────────────────────────────────────────────
 TRADIER_TOKEN: str = os.environ.get("TRADIER_TOKEN", "")
 
+# ── HTTP command API ──────────────────────────────────────────────────────────
+# Secret token the dashboard sends in X-Token header. Leave empty to disable auth.
+COMMAND_TOKEN: str = os.environ.get("COMMAND_TOKEN", "")
+
 # ── Manual command permissions ────────────────────────────────────────────────
 # Comma-separated Telegram user IDs allowed to run on-demand report commands.
 # Leave empty (unset) to allow any user who can message the bot.

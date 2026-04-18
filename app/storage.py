@@ -71,6 +71,19 @@ def init_db() -> None:
                 conn.execute(f"ALTER TABLE signals ADD COLUMN {_col}")
             except sqlite3.OperationalError:
                 pass
+
+        # Flow interpreter event log
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS flow_events (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_type TEXT NOT NULL,
+                label      TEXT,
+                signal_id  TEXT,
+                ticker     TEXT,
+                content    TEXT NOT NULL,
+                timestamp  TEXT NOT NULL
+            )
+        """)
     logger.info("Storage initialised at %s", _DB)
 
 
@@ -149,6 +162,46 @@ def record_signal(sig, price, state: str = "HOLD", classification: str = None) -
             "price_at_signal":   price,
             "classification":    classification,
             "premium_at_signal": prem,
+        },),
+        daemon=True,
+    ).start()
+
+
+def _push_event_to_dashboard(payload: dict) -> None:
+    base_url = config.__dict__.get("DASHBOARD_INGEST_URL", "") or ""
+    if not base_url:
+        return
+    url = base_url.rsplit("/api/", 1)[0] + "/api/ingest-event"
+    try:
+        import httpx
+        httpx.post(url, json=payload, timeout=2.0)
+    except Exception:
+        pass
+
+
+def record_event(
+    event_type: str,
+    content: str,
+    label: str = None,
+    signal_id: str = None,
+    ticker: str = None,
+) -> None:
+    """Log a Channel A or B formatted message to flow_events."""
+    ts = datetime.utcnow().isoformat()
+    with _connect() as conn:
+        conn.execute("""
+            INSERT INTO flow_events (event_type, label, signal_id, ticker, content, timestamp)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, (event_type, label, signal_id, ticker, content, ts))
+    threading.Thread(
+        target=_push_event_to_dashboard,
+        args=({
+            "event_type": event_type,
+            "label":      label,
+            "signal_id":  signal_id,
+            "ticker":     ticker,
+            "content":    content,
+            "timestamp":  ts,
         },),
         daemon=True,
     ).start()
