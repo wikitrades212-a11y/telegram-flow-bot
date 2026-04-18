@@ -198,8 +198,15 @@ try:
     def _http_list():
         return {"commands": sorted(_CMD)}
 
+    # Populated inside main() so post_to_b closure is accessible
+    _SEND: dict = {}
+
     @_http_app.get("/command/{cmd}")
-    async def _http_cmd(cmd: str, x_token: str = _FH(default="")):
+    async def _http_cmd(
+        cmd: str,
+        x_token: str = _FH(default=""),
+        send: bool = False,
+    ):
         if config.COMMAND_TOKEN and x_token != config.COMMAND_TOKEN:
             raise _FE(status_code=401, detail="Unauthorized")
         fn = _CMD.get(cmd)
@@ -207,7 +214,11 @@ try:
             raise _FE(status_code=404, detail=f"Unknown command: {cmd}")
         try:
             text = await fn()
-            return {"ok": True, "text": text, "cmd": cmd}
+            posted = False
+            if send and _SEND.get("b"):
+                await _SEND["b"](text, label=cmd.upper())
+                posted = True
+            return {"ok": True, "text": text, "cmd": cmd, "posted": posted}
         except Exception as exc:
             logger.error("HTTP command %s failed: %s", cmd, exc, exc_info=True)
             raise _FE(status_code=500, detail=str(exc))
@@ -552,6 +563,9 @@ async def main() -> None:
                 "Channel A (intel) send FAILED | chat_id=%s | signal=%s | error: %s",
                 config.INTEL_CHANNEL, signal_id or "?", exc,
             )
+
+    # Register post_to_b so the HTTP command endpoint can send to Channel B
+    _SEND["b"] = post_to_b
 
     # ── GO callback for watcher ───────────────────────────────────────────────
 
